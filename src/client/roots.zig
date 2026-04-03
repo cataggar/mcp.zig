@@ -16,11 +16,30 @@ pub const RootsListResult = struct {
     roots: []const Root,
 };
 
-/// Creates a file root from a filesystem path.
+/// Creates a root from a filesystem path without allocating.
+///
+/// If `path` already uses `file://`, it is returned unchanged.
+/// Otherwise this returns `path` as-is. Use `fileRootAlloc` when you need
+/// a canonical `file://` URI from a plain filesystem path.
 pub fn fileRoot(path: []const u8, name: ?[]const u8) Root {
-    var uri_buf: [1024]u8 = undefined;
-    const uri = std.fmt.bufPrint(&uri_buf, "file://{s}", .{path}) catch path;
+    if (std.mem.startsWith(u8, path, "file://")) {
+        return .{ .uri = path, .name = name };
+    }
+    return .{ .uri = path, .name = name };
+}
+
+/// Creates a canonical `file://` root URI by allocating the URI string.
+pub fn fileRootAlloc(allocator: std.mem.Allocator, path: []const u8, name: ?[]const u8) !Root {
+    if (std.mem.startsWith(u8, path, "file://")) {
+        return .{ .uri = try allocator.dupe(u8, path), .name = name };
+    }
+    const uri = try std.fmt.allocPrint(allocator, "file://{s}", .{path});
     return .{ .uri = uri, .name = name };
+}
+
+/// Frees URI memory allocated by `fileRootAlloc`.
+pub fn deinitAllocatedRoot(allocator: std.mem.Allocator, r: *Root) void {
+    allocator.free(r.uri);
 }
 
 /// Creates a root with a pre-formed URI.
@@ -35,6 +54,13 @@ pub fn isValidRootUri(uri: []const u8) bool {
 
 test "fileRoot" {
     const r = fileRoot("/home/user/project", "Project");
+    try std.testing.expectEqualStrings("/home/user/project", r.uri);
+    try std.testing.expectEqualStrings("Project", r.name.?);
+}
+
+test "fileRootAlloc" {
+    var r = try fileRootAlloc(std.testing.allocator, "/home/user/project", "Project");
+    defer deinitAllocatedRoot(std.testing.allocator, &r);
     try std.testing.expect(std.mem.startsWith(u8, r.uri, "file://"));
     try std.testing.expectEqualStrings("Project", r.name.?);
 }
