@@ -15,12 +15,12 @@
 <img src="https://img.shields.io/badge/platforms-linux%20%7C%20windows%20%7C%20macos-blue" alt="Supported Platforms">
 <a href="https://github.com/muhammad-fiaz/mcp.zig/releases/latest"><img src="https://img.shields.io/github/v/release/muhammad-fiaz/mcp.zig?label=Latest%20Release&style=flat-square" alt="Latest Release"></a>
 <a href="https://pay.muhammadfiaz.com"><img src="https://img.shields.io/badge/Sponsor-pay.muhammadfiaz.com-ff69b4?style=flat&logo=heart" alt="Sponsor"></a>
-<a href="https://github.com/sponsors/muhammad-fiaz"><img src="https://img.shields.io/badge/Sponsor-💖-pink?style=social&logo=github" alt="GitHub Sponsors"></a>
+<a href="https://github.com/sponsors/muhammad-fiaz"><img src="https://img.shields.io/badge/Sponsor-GitHub-pink?style=social&logo=github" alt="GitHub Sponsors"></a>
 <a href="https://hits.sh/github.com/muhammad-fiaz/mcp.zig/"><img src="https://hits.sh/github.com/muhammad-fiaz/mcp.zig.svg?label=Visitors&extraCount=0&color=green" alt="Repo Visitors"></a>
 
 <p><em>A Model Context Protocol (MCP) library for the Zig ecosystem.</em></p>
 
-<b>📚 <a href="https://muhammad-fiaz.github.io/mcp.zig/">Documentation</a> |
+<b><a href="https://muhammad-fiaz.github.io/mcp.zig/">Documentation</a> |
 <a href="https://muhammad-fiaz.github.io/mcp.zig/api/">API Reference</a> |
 <a href="https://muhammad-fiaz.github.io/mcp.zig/guide/getting-started">Quick Start</a> |
 <a href="https://muhammad-fiaz.github.io/mcp.zig/contributing">Contributing</a></b>
@@ -29,33 +29,33 @@
 
 ---
 
-## 🔌 What is MCP?
+## What is MCP?
 
 **Model Context Protocol (MCP)** is an open-source standard for connecting AI applications to external systems.
 **Think of MCP like a USB-C port for AI applications.** Just as USB-C provides a standardized way to connect electronic devices, MCP provides a standardized way to connect AI applications to external systems.
 
-## 🎯 Why mcp.zig?
+## Why mcp.zig?
 
 The [Model Context Protocol (MCP)](https://modelcontextprotocol.io/docs/getting-started/intro) is an open standard by Anthropic for connecting AI applications to external systems. While MCP has official SDKs for TypeScript, Python, and other languages, **Zig currently lacks proper MCP support**.
 
 **mcp.zig** aims to fill this gap by providing a native, high-performance MCP implementation for the Zig programming language, enabling Zig developers to:
 
-- 🔧 Build MCP servers that expose tools, resources, and prompts to AI applications
-- 🔌 Create MCP clients that connect to any MCP-compatible server
-- ⚡ Leverage Zig's performance and safety features for AI integrations
+- Build MCP servers that expose tools, resources, and prompts to AI applications
+- Create MCP clients that connect to any MCP-compatible server
+- Leverage Zig's performance and safety features for AI integrations
 
-## ✨ Features
+## Features
 
-- 🛠️ **Server Framework** - Build MCP servers that expose tools, resources, and prompts
-- 🔌 **Client Framework** - Create MCP clients with full support for roots, sampling, and elicitation
-- 🚀 **Tasks System** - Advanced support for long-running, interactive tasks
-- 📦 **Rich Content** - Full support for text, images, audio, and embedded resources
-- 📡 **Transport Layer** - STDIO and HTTP transport support
-- 📋 **Full Protocol Support** - JSON-RPC 2.0, capability negotiation, lifecycle management
-- ⚡ **Native Performance** - Written in pure Zig for optimal performance
-- 🧪 **Comprehensive Testing** - Unit tests for all components
+- **Server Framework** - Build MCP servers that expose tools, resources, and prompts
+- **Client Framework** - Create MCP clients with full support for roots, sampling, and elicitation
+- **Tasks System** - Advanced support for long-running, interactive tasks
+- **Rich Content** - Full support for text, images, audio, and embedded resources
+- **Transport Layer** - STDIO and HTTP transport support
+- **Full Protocol Support** - JSON-RPC 2.0, capability negotiation, lifecycle management
+- **Native Performance** - Written in pure Zig for optimal performance
+- **Comprehensive Testing** - Unit tests for all components
 
-## 📚 Documentation
+## Documentation
 
 Full documentation is available at **[muhammad-fiaz.github.io/mcp.zig](https://muhammad-fiaz.github.io/mcp.zig/)**
 
@@ -64,7 +64,7 @@ For the official MCP specification and resources, visit:
 - [MCP Documentation](https://modelcontextprotocol.io/docs/getting-started/intro)
 - [MCP Specification](https://spec.modelcontextprotocol.io/)
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
@@ -173,7 +173,7 @@ fn run() !void {
 }
 ```
 
-## 📁 Examples
+## Examples
 
 The `examples/` directory contains several example implementations:
 
@@ -196,7 +196,7 @@ zig build run-weather
 zig build run-calc
 ```
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 src/
@@ -217,7 +217,7 @@ src/
     └── client.zig       # Client implementation
 ```
 
-## 🛠️ Server Features
+## Server Features
 
 ### Tools
 
@@ -259,7 +259,7 @@ try server.addPrompt(.{
 });
 ```
 
-## 🔌 Client Features
+## Client Features
 
 ### Roots
 
@@ -278,7 +278,7 @@ Allow servers to request LLM completions:
 client.enableSampling();
 ```
 
-## 🧪 Testing
+## Testing
 
 Run the test suite:
 
@@ -294,38 +294,38 @@ zig build test-compile -Dtarget=x86_64-windows
 zig build test-compile -Dtarget=x86_64-macos
 ```
 
-## 📖 Protocol Version
+## Protocol Version
 
 This library implements MCP protocol version **2025-11-25**.
 
 | Version    | Status        |
 | ---------- | ------------- |
-| 2025-11-25 | ✅ Supported  |
-| 2025-06-18 | ✅ Compatible |
-| 2025-03-26 | ✅ Compatible |
-| 2024-11-05 | ✅ Compatible |
+| 2025-11-25 | Supported  |
+| 2025-06-18 | Compatible |
+| 2025-03-26 | Compatible |
+| 2024-11-05 | Compatible |
 
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
 
 See [Contributing Guide](https://muhammad-fiaz.github.io/mcp.zig/contributing) for guidelines.
 
-## 💖 Support
+## Support
 
 If you find this project helpful, consider supporting its development:
 
 <a href="https://pay.muhammadfiaz.com"><img src="https://img.shields.io/badge/Sponsor-pay.muhammadfiaz.com-ff69b4?style=for-the-badge&logo=heart" alt="Sponsor"></a>
-<a href="https://github.com/sponsors/muhammad-fiaz"><img src="https://img.shields.io/badge/GitHub_Sponsors-💖-pink?style=for-the-badge&logo=github" alt="GitHub Sponsors"></a>
+<a href="https://github.com/sponsors/muhammad-fiaz"><img src="https://img.shields.io/badge/GitHub_Sponsors-GitHub-pink?style=for-the-badge&logo=github" alt="GitHub Sponsors"></a>
 
-## 📄 License
+## License
 
 MIT License - see [LICENSE](LICENSE) for details.
 
-## 🔗 Resources
+## Resources
 
-- [📚 mcp.zig Documentation](https://muhammad-fiaz.github.io/mcp.zig/)
-- [🌐 Official MCP Documentation](https://modelcontextprotocol.io/docs/getting-started/intro)
-- [📋 MCP Specification](https://spec.modelcontextprotocol.io)
-- [💻 MCP GitHub](https://github.com/modelcontextprotocol)
+- [mcp.zig Documentation](https://muhammad-fiaz.github.io/mcp.zig/)
+- [Official MCP Documentation](https://modelcontextprotocol.io/docs/getting-started/intro)
+- [MCP Specification](https://spec.modelcontextprotocol.io)
+- [MCP GitHub](https://github.com/modelcontextprotocol)

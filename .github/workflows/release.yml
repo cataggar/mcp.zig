@@ -11,6 +11,7 @@ jobs:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
@@ -21,15 +22,61 @@ jobs:
       - name: Run Tests
         run: zig build test
 
+  cross-target-validate:
+    name: Cross-target Build/Test Compile (${{ matrix.target }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86-linux
+            os: linux
+            arch: x86
+          - target: x86_64-linux
+            os: linux
+            arch: x86_64
+          - target: aarch64-linux
+            os: linux
+            arch: aarch64
+          - target: x86-windows
+            os: windows
+            arch: x86
+          - target: x86_64-windows
+            os: windows
+            arch: x86_64
+          - target: aarch64-windows
+            os: windows
+            arch: aarch64
+          - target: x86_64-macos
+            os: macos
+            arch: x86_64
+          - target: aarch64-macos
+            os: macos
+            arch: aarch64
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Compile library and examples
+        run: zig build -Dtarget=${{ matrix.target }}
+
+      - name: Compile unit tests (no execution)
+        run: zig build test-compile -Dtarget=${{ matrix.target }}
+
   build-library:
     name: Build Library (${{ matrix.target }})
-    needs: test
+    needs: [test, cross-target-validate]
     runs-on: ubuntu-latest
     strategy:
       matrix:
         target:
           - x86_64-windows
           - x86-windows
+          - aarch64-windows
           - x86_64-linux
           - x86-linux
           - aarch64-linux
@@ -128,6 +175,7 @@ jobs:
             |----------|--------------|------|
             | Windows | x86_64 | [mcp-x86_64-windows.lib](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mcp-x86_64-windows.lib) |
             | Windows | x86 | [mcp-x86-windows.lib](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mcp-x86-windows.lib) |
+            | Windows | aarch64 (ARM64) | [mcp-aarch64-windows.lib](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/mcp-aarch64-windows.lib) |
             | Linux | x86_64 | [libmcp-x86_64-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libmcp-x86_64-linux.a) |
             | Linux | x86 | [libmcp-x86-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libmcp-x86-linux.a) |
             | Linux | aarch64 (ARM64) | [libmcp-aarch64-linux.a](https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/libmcp-aarch64-linux.a) |
