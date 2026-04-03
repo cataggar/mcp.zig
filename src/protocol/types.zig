@@ -6,7 +6,6 @@
 
 const std = @import("std");
 
-
 /// Request ID can be a string or integer, used to match responses to requests.
 pub const RequestId = union(enum) {
     string: []const u8,
@@ -80,7 +79,6 @@ pub const LoggingLevel = enum {
     }
 };
 
-
 /// Optional annotations for the client. The client can use annotations to
 /// inform how objects are used or displayed.
 pub const Annotations = struct {
@@ -105,7 +103,6 @@ pub const Icon = struct {
 
     pub const IconTheme = enum { light, dark };
 };
-
 
 /// Describes the MCP implementation (client or server).
 pub const Implementation = struct {
@@ -199,7 +196,6 @@ pub const ClientTasksCapability = struct {
         } = null,
     } = null,
 };
-
 
 /// Action for an elicitation response.
 pub const ElicitationAction = enum {
@@ -299,7 +295,6 @@ pub const ContentBlock = union(enum) {
 /// Legacy alias for backward compatibility.
 pub const ContentItem = ContentBlock;
 
-
 /// A request from the assistant to call a tool (used in sampling).
 pub const ToolUseContent = struct {
     type: []const u8 = "tool_use",
@@ -340,7 +335,6 @@ pub const ToolChoice = struct {
     /// "none" | "required" | "auto"
     mode: ?[]const u8 = null,
 };
-
 
 /// Content of a text resource.
 pub const TextResourceContents = struct {
@@ -393,7 +387,6 @@ pub const ResourceTemplate = struct {
     _meta: ?std.json.Value = null,
 };
 
-
 /// Definition of a tool exposed by a server.
 pub const ToolDefinition = struct {
     icons: ?[]const Icon = null,
@@ -445,7 +438,6 @@ pub const ToolAnnotations = struct {
     openWorldHint: ?bool = null,
 };
 
-
 /// Definition of a prompt template.
 pub const PromptDefinition = struct {
     icons: ?[]const Icon = null,
@@ -470,7 +462,6 @@ pub const PromptMessage = struct {
     content: ContentBlock,
 };
 
-
 /// Message issued to or received from an LLM API.
 pub const SamplingMessage = struct {
     role: Role,
@@ -491,7 +482,6 @@ pub const ModelHint = struct {
     name: ?[]const u8 = null,
 };
 
-
 /// Represents a root directory or file that the server can operate on.
 pub const Root = struct {
     /// The URI identifying the root. Must start with file:// for now.
@@ -500,7 +490,6 @@ pub const Root = struct {
     name: ?[]const u8 = null,
     _meta: ?std.json.Value = null,
 };
-
 
 /// Reference for argument completion.
 pub const CompletionRef = union(enum) {
@@ -531,7 +520,6 @@ pub const CompletionResult = struct {
     total: ?u64 = null,
     hasMore: ?bool = null,
 };
-
 
 /// The status of a task.
 pub const TaskStatus = enum {
@@ -577,7 +565,6 @@ pub const CreateTaskResult = struct {
 pub const RelatedTaskMetadata = struct {
     taskId: []const u8,
 };
-
 
 /// Restricted schema definitions for elicitation form fields.
 pub const PrimitiveSchemaDefinition = union(enum) {
@@ -641,7 +628,6 @@ pub const EnumOption = struct {
     title: []const u8,
 };
 
-
 /// JSON-RPC error object.
 pub const JsonRpcError = struct {
     code: i32,
@@ -649,12 +635,10 @@ pub const JsonRpcError = struct {
     data: ?std.json.Value = null,
 };
 
-
 /// Base result type. All results can carry _meta.
 pub const Result = struct {
     _meta: ?std.json.Value = null,
 };
-
 
 test "RequestId equality" {
     const id1 = RequestId{ .integer = 42 };

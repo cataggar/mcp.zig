@@ -99,7 +99,6 @@ pub const Method = enum {
     }
 };
 
-
 /// Parameters for the initialize request.
 pub const InitializeParams = struct {
     _meta: ?std.json.Value = null,
@@ -116,7 +115,6 @@ pub const InitializeResult = struct {
     serverInfo: types.Implementation,
     instructions: ?[]const u8 = null,
 };
-
 
 /// Result of listing available tools.
 pub const ToolsListResult = struct {
@@ -140,7 +138,6 @@ pub const ToolCallResult = struct {
     structuredContent: ?std.json.Value = null,
     isError: ?bool = null,
 };
-
 
 /// Result of listing available resources.
 pub const ResourcesListResult = struct {
@@ -186,7 +183,6 @@ pub const ResourceUpdatedParams = struct {
     uri: []const u8,
 };
 
-
 /// Result of listing available prompts.
 pub const PromptsListResult = struct {
     _meta: ?std.json.Value = null,
@@ -207,7 +203,6 @@ pub const PromptsGetResult = struct {
     description: ?[]const u8 = null,
     messages: []const types.PromptMessage,
 };
-
 
 /// Parameters for creating a sampling message (LLM completion request).
 pub const SamplingCreateMessageParams = struct {
@@ -233,7 +228,6 @@ pub const SamplingCreateMessageResult = struct {
     role: types.Role,
     content: types.SamplingMessageContentBlock,
 };
-
 
 /// Parameters for creating an elicitation request (form mode).
 pub const ElicitationFormParams = struct {
@@ -267,7 +261,6 @@ pub const ElicitationCreateResult = struct {
     content: ?std.json.Value = null,
 };
 
-
 /// Log severity levels following syslog conventions.
 pub const LogLevel = types.LoggingLevel;
 
@@ -284,7 +277,6 @@ pub const LogMessageNotification = struct {
     logger: ?[]const u8 = null,
     data: std.json.Value,
 };
-
 
 /// Progress notification payload for long-running operations.
 pub const ProgressNotification = struct {
@@ -303,13 +295,11 @@ pub const CancelledNotification = struct {
     reason: ?[]const u8 = null,
 };
 
-
 /// Result of listing filesystem roots.
 pub const RootsListResult = struct {
     _meta: ?std.json.Value = null,
     roots: []const types.Root,
 };
-
 
 /// Parameters for argument completion.
 pub const CompletionCompleteParams = struct {
@@ -326,7 +316,6 @@ pub const CompletionCompleteResult = struct {
     _meta: ?std.json.Value = null,
     completion: types.CompletionResult,
 };
-
 
 /// Parameters for tasks/get request.
 pub const GetTaskParams = struct {
@@ -392,7 +381,6 @@ pub const ElicitationCompleteParams = struct {
     elicitationId: []const u8,
 };
 
-
 /// Builds an initialize request message.
 pub fn buildInitializeRequest(
     id: types.RequestId,
@@ -446,7 +434,6 @@ fn serializeResult(value: anytype) ?std.json.Value {
     _ = value;
     return null;
 }
-
 
 test "Method enum" {
     try std.testing.expectEqualStrings("initialize", Method.initialize.toString());

@@ -323,7 +323,17 @@ pub const Server = struct {
             return;
         };
 
-        const body_items = body_reader.readAlloc(self.allocator, content_length) catch {
+        const read_len = std.math.cast(usize, content_length) orelse {
+            try request.respond("Request body too large", .{
+                .status = .bad_request,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/plain" },
+                },
+            });
+            return;
+        };
+
+        const body_items = body_reader.readAlloc(self.allocator, read_len) catch {
             try request.respond("Failed to read request body", .{
                 .status = .bad_request,
                 .extra_headers = &.{
