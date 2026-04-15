@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const mcp = @import("mcp");
+const native_os = @import("builtin").os.tag;
 
 pub fn main() void {
     run() catch |err| {
@@ -102,9 +103,11 @@ fn echoHandler(allocator: std.mem.Allocator, args: ?std.json.Value) mcp.tools.To
     // Demonstrate structured result
     var obj: std.json.ObjectMap = .{};
     obj.put(allocator, "echo", .{ .string = message }) catch {};
-    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    obj.put(allocator, "timestamp", .{ .integer = ts.sec }) catch {};
+    if (native_os != .windows) {
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+        _ = std.c.clock_gettime(.REALTIME, &ts);
+        obj.put(allocator, "timestamp", .{ .integer = ts.sec }) catch {};
+    }
 
     return mcp.tools.structuredResult(allocator, .{ .object = obj }) catch return mcp.tools.ToolError.OutOfMemory;
 }

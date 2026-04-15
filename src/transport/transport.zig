@@ -5,6 +5,8 @@
 //! transport for remote server connections.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const native_os = builtin.os.tag;
 const jsonrpc = @import("../protocol/jsonrpc.zig");
 const types = @import("../protocol/types.zig");
 
@@ -50,6 +52,92 @@ pub const Transport = struct {
     }
 };
 
+/// Cross-platform file handle type.
+const Handle = if (native_os == .windows) std.os.windows.HANDLE else std.posix.fd_t;
+
+fn stdoutHandle() Handle {
+    return if (native_os == .windows)
+        std.os.windows.peb().ProcessParameters.hStdOutput
+    else
+        std.posix.STDOUT_FILENO;
+}
+
+fn stdinHandle() Handle {
+    return if (native_os == .windows)
+        std.os.windows.peb().ProcessParameters.hStdInput
+    else
+        std.posix.STDIN_FILENO;
+}
+
+fn stderrHandle() Handle {
+    return if (native_os == .windows)
+        std.os.windows.peb().ProcessParameters.hStdError
+    else
+        std.posix.STDERR_FILENO;
+}
+
+fn writeAll(handle: Handle, data: []const u8) !void {
+    if (native_os == .windows) {
+        const windows = std.os.windows;
+        var written: usize = 0;
+        while (written < data.len) {
+            const remaining = data[written..];
+            var iosb: windows.IO_STATUS_BLOCK = undefined;
+            const status = windows.ntdll.NtWriteFile(
+                handle,
+                null,
+                null,
+                null,
+                &iosb,
+                remaining.ptr,
+                @intCast(remaining.len),
+                null,
+                null,
+            );
+            switch (status) {
+                .SUCCESS => {},
+                else => return error.WriteFailed,
+            }
+            written += iosb.Information;
+        }
+    } else {
+        var written: usize = 0;
+        while (written < data.len) {
+            const remaining = data[written..];
+            const rc = std.c.write(handle, remaining.ptr, remaining.len);
+            if (rc < 0) return error.WriteFailed;
+            written += @intCast(rc);
+        }
+    }
+}
+
+fn readSlice(handle: Handle, buf: []u8) !usize {
+    if (native_os == .windows) {
+        const windows = std.os.windows;
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        const status = windows.ntdll.NtReadFile(
+            handle,
+            null,
+            null,
+            null,
+            &iosb,
+            buf.ptr,
+            @intCast(buf.len),
+            null,
+            null,
+        );
+        return switch (status) {
+            .SUCCESS => iosb.Information,
+            .END_OF_FILE => 0,
+            else => error.ReadFailed,
+        };
+    } else {
+        const rc = std.c.read(handle, buf.ptr, buf.len);
+        if (rc < 0) return error.ReadFailed;
+        return @intCast(rc);
+    }
+}
+
 /// STDIO transport for local process communication.
 /// Messages are delimited by newlines and sent via stdin/stdout.
 pub const StdioTransport = struct {
@@ -77,9 +165,8 @@ pub const StdioTransport = struct {
     pub fn send(self: *Self, message: []const u8) Transport.SendError!void {
         if (self.is_closed) return Transport.SendError.ConnectionClosed;
 
-        const stdout_fd = std.posix.STDOUT_FILENO;
-        writeAllFd(stdout_fd, message) catch return Transport.SendError.WriteError;
-        writeAllFd(stdout_fd, "\n") catch return Transport.SendError.WriteError;
+        writeAll(stdoutHandle(), message) catch return Transport.SendError.WriteError;
+        writeAll(stdoutHandle(), "\n") catch return Transport.SendError.WriteError;
     }
 
     /// Sends a JSON-RPC message object.
@@ -95,11 +182,11 @@ pub const StdioTransport = struct {
 
         self.read_buffer.clearRetainingCapacity();
 
-        const stdin_fd = std.posix.STDIN_FILENO;
+        const handle = stdinHandle();
 
         while (true) {
             var buf: [1]u8 = undefined;
-            const bytes_read = readFd(stdin_fd, &buf) catch return Transport.ReceiveError.ReadError;
+            const bytes_read = readSlice(handle, &buf) catch return Transport.ReceiveError.ReadError;
 
             if (bytes_read == 0) {
                 if (self.read_buffer.items.len == 0) {
@@ -138,25 +225,9 @@ pub const StdioTransport = struct {
     /// Writes a message to stderr for logging.
     pub fn writeStderr(self: *Self, message: []const u8) void {
         _ = self;
-        const stderr_fd = std.posix.STDERR_FILENO;
-        writeAllFd(stderr_fd, message) catch {};
-        writeAllFd(stderr_fd, "\n") catch {};
-    }
-
-    fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
-        var written: usize = 0;
-        while (written < data.len) {
-            const remaining = data[written..];
-            const rc = std.c.write(fd, remaining.ptr, remaining.len);
-            if (rc < 0) return error.WriteFailed;
-            written += @intCast(rc);
-        }
-    }
-
-    fn readFd(fd: std.posix.fd_t, buf: []u8) !usize {
-        const rc = std.c.read(fd, buf.ptr, buf.len);
-        if (rc < 0) return error.ReadFailed;
-        return @intCast(rc);
+        const handle = stderrHandle();
+        writeAll(handle, message) catch {};
+        writeAll(handle, "\n") catch {};
     }
 
     /// Returns a Transport interface for this STDIO transport.
