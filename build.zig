@@ -4,9 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // -------------------------------------------------------------------------
-    // Library module (public — for downstream projects)
-    // -------------------------------------------------------------------------
     _ = b.addModule("mcp", .{
         .root_source_file = b.path("src/mcp.zig"),
     });
@@ -23,6 +20,15 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    // Documentation generation
+    const docs_step = b.step("docs", "Generate library documentation");
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = lib.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    docs_step.dependOn(&install_docs.step);
+
     // Internal module used by examples and tests
     const mcp_module = b.createModule(.{
         .root_source_file = b.path("src/mcp.zig"),
@@ -30,9 +36,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // -------------------------------------------------------------------------
     // Unit tests
-    // -------------------------------------------------------------------------
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/mcp.zig"),
         .target = target,
@@ -47,9 +51,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // -------------------------------------------------------------------------
     // Helper: add a named example executable
-    // -------------------------------------------------------------------------
     const all_step = b.step("run-all-examples", "Build all examples");
 
     const Example = struct { name: []const u8, src: []const u8, run_step: []const u8, desc: []const u8 };

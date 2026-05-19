@@ -297,6 +297,16 @@ zig build test-compile -Dtarget=x86_64-windows
 zig build test-compile -Dtarget=x86_64-macos
 ```
 
+## Generating Documentation
+
+Generate native, interactive HTML API documentation for the library:
+
+```bash
+zig build docs
+```
+
+The generated files (including `index.html`, `main.js`, and `main.wasm`) will be located in the `zig-out/docs/` directory. You can view them using any standard web browser.
+
 ## Protocol Version
 
 This library implements MCP protocol version **2025-11-25**.
