@@ -60,7 +60,6 @@ pub const ToolError = error{
 /// Builder for creating tools with a fluent API.
 pub const ToolBuilder = struct {
     tool: Tool,
-    input_builder: ?schema.InputSchemaBuilder = null,
 
     const Self = @This();
 
@@ -95,6 +94,12 @@ pub const ToolBuilder = struct {
     /// Sets the input schema for the tool.
     pub fn inputSchema(self: *Self, schema_value: types.InputSchema) *Self {
         self.tool.inputSchema = schema_value;
+        return self;
+    }
+
+    /// Sets the input schema from an InputSchemaBuilder using an allocator.
+    pub fn inputSchemaFromBuilder(self: *Self, allocator: std.mem.Allocator, builder: *schema.InputSchemaBuilder) !*Self {
+        self.tool.inputSchema = try builder.toInputSchema(allocator);
         return self;
     }
 
@@ -343,6 +348,27 @@ test "ToolBuilder" {
     try std.testing.expectEqualStrings("test_tool", tool.name);
     try std.testing.expectEqualStrings("A test tool", tool.description.?);
     try std.testing.expect(tool.annotations.?.readOnlyHint);
+}
+
+test "ToolBuilder with inputSchemaFromBuilder" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var schema_builder = schema.InputSchemaBuilder.init(allocator);
+    defer schema_builder.deinit(allocator);
+
+    _ = try schema_builder.addString(allocator, "query", "Search query", true);
+
+    var builder: ToolBuilder = .init("search_tool");
+    _ = try builder
+        .description("Search tool")
+        .inputSchemaFromBuilder(allocator, &schema_builder);
+    const tool = builder.build();
+
+    try std.testing.expectEqualStrings("search_tool", tool.name);
+    try std.testing.expectEqualStrings("object", tool.inputSchema.?.type);
+    try std.testing.expectEqualStrings("query", tool.inputSchema.?.required.?[0]);
 }
 
 test "ToolBuilder with task support" {
