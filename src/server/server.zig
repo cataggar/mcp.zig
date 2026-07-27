@@ -5186,15 +5186,28 @@ test "a slow tool no longer blocks the requests behind it" {
 
     var runner: LoopRunner = .{ .server = &server, .io = io, .transport = scripted.transport() };
     const loop = try std.Thread.spawn(.{}, LoopRunner.run, .{&runner});
+    // A failing assertion below must not leave the tool spinning and the loop
+    // running against state the test is about to free.
+    defer {
+        gated.release.store(true, .release);
+        scripted.finish.store(true, .release);
+        loop.join();
+    }
 
     // The ping is answered while the tool is still inside its handler, which
-    // is the whole point: a sequential loop could not have replied yet.
+    // is the whole point: a sequential loop could not have replied yet. Wait
+    // for the handler to be entered first, or the assertion could pass simply
+    // because the worker had not picked the call up.
+    try waitFor(io, &gated, struct {
+        fn f(g: *GatedTool) bool {
+            return g.entered.load(.acquire) == 1;
+        }
+    }.f);
     try waitFor(io, &scripted, struct {
         fn f(t: *ScriptedTransport) bool {
             return t.sawResponse("\"id\":3");
         }
     }.f);
-    try std.testing.expectEqual(@as(usize, 1), gated.entered.load(.acquire));
     try std.testing.expect(!scripted.sawResponse("\"id\":2"));
 
     gated.release.store(true, .release);
@@ -5203,9 +5216,6 @@ test "a slow tool no longer blocks the requests behind it" {
             return t.sawResponse("\"id\":2");
         }
     }.f);
-
-    scripted.finish.store(true, .release);
-    loop.join();
 }
 
 test "a tool call is refused when every worker is occupied" {
@@ -5231,6 +5241,11 @@ test "a tool call is refused when every worker is occupied" {
 
     var runner: LoopRunner = .{ .server = &server, .io = io, .transport = scripted.transport() };
     const loop = try std.Thread.spawn(.{}, LoopRunner.run, .{&runner});
+    defer {
+        gated.release.store(true, .release);
+        scripted.finish.store(true, .release);
+        loop.join();
+    }
 
     // Refused, not queued: the client hears about it immediately.
     try waitFor(io, &scripted, struct {
@@ -5247,9 +5262,6 @@ test "a tool call is refused when every worker is occupied" {
             return t.sawResponse("\"id\":2");
         }
     }.f);
-
-    scripted.finish.store(true, .release);
-    loop.join();
 }
 
 test "without workers the loop stays sequential and refuses nothing" {
@@ -5274,13 +5286,14 @@ test "without workers the loop stays sequential and refuses nothing" {
     var runner: LoopRunner = .{ .server = &server, .io = io, .transport = scripted.transport() };
     const loop = try std.Thread.spawn(.{}, LoopRunner.run, .{&runner});
 
+    defer loop.join();
+    defer scripted.finish.store(true, .release);
+
     try waitFor(io, &scripted, struct {
         fn f(t: *ScriptedTransport) bool {
             return t.responseCount() >= 3;
         }
     }.f);
-    scripted.finish.store(true, .release);
-    loop.join();
 
     try std.testing.expect(scripted.sawResponse("\"id\":2"));
     try std.testing.expect(scripted.sawResponse("\"id\":3"));
