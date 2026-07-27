@@ -69,6 +69,14 @@ try server.run(io, allocator, .{ .http = .{
 | `auth_token` | `null` | Bearer token required on every request. Mandatory for non-loopback binds; minimum 32 characters. |
 | `allowed_origins` | `&.{}` | Origins allowed to make browser-initiated requests. Empty rejects any request carrying `Origin`. |
 
+Session limits are fields on `Server` rather than on the run config:
+
+| Field | Default | Purpose |
+| ----- | ------- | ------- |
+| `max_sessions` | `256` | Concurrently tracked HTTP sessions. Further handshakes get `503`. |
+| `session_idle_timeout_s` | `300` | Idle seconds before a session is reclaimed. |
+| `max_tasks_per_session` | `256` | Tasks retained per session. |
+
 When `auth_token` is set, every request must carry
 `Authorization: Bearer <token>`; anything else is answered with `401` before
 the body is read. The configuration is validated before the listener is
@@ -102,21 +110,50 @@ try client.connectHttp(io, allocator, "http://localhost:8080");
 
 ### Endpoints
 
-| Endpoint | Method | Description       |
-| -------- | ------ | ----------------- |
-| `/`      | POST   | JSON-RPC endpoint |
+| Endpoint | Method | Description             |
+| -------- | ------ | ----------------------- |
+| `/`      | POST   | JSON-RPC endpoint       |
+| `/`      | DELETE | Terminate a session     |
+
+### Sessions
+
+Each client gets its own state. The handshake, the negotiated client info, the
+log level set via `logging/setLevel` and any tasks belong to one session and are
+invisible to every other client.
+
+`initialize` is answered with an `Mcp-Session-Id` header. Every later request
+must repeat that header, or the server answers `-32002 Server not initialized`;
+an unrecognised or expired id is answered with `404`. The id is 32 bytes from
+the secure random source, rendered as hex, and the session table is keyed by its
+SHA-256 digest so a lookup never compares the value a client presented.
+
+Treat the id as a credential: anything holding it can act as that client.
+
+`stdio` and custom transports carry exactly one client, so they use a single
+implicit session and need no header.
 
 ### HTTP Request Format
 
 Send JSON-RPC payloads as `application/json` with HTTP `POST`:
 
 ```bash
-curl -X POST http://localhost:8080 \
+# Handshake. The response carries the session id.
+curl -sD - -X POST http://localhost:8080 \
     -H "Content-Type: application/json" \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+
+# Every later request repeats it.
+curl -X POST http://localhost:8080 \
+    -H "Content-Type: application/json" \
+    -H "Mcp-Session-Id: <id from the handshake>" \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# Release the session early. Otherwise it expires on the idle timeout.
+curl -X DELETE http://localhost:8080 -H "Mcp-Session-Id: <id>"
 ```
 
-The response body contains the JSON-RPC response.
+The response body contains the JSON-RPC response. `connectHttp` records and
+replays the session id for you.
 
 ### Example Pattern
 
