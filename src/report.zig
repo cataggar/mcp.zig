@@ -5,7 +5,6 @@
 const std = @import("std");
 const http = std.http;
 const SemanticVersion = std.SemanticVersion;
-const builtin = @import("builtin");
 
 const Network = @import("utils/network.zig");
 const version_info = @import("version.zig");
@@ -82,11 +81,22 @@ fn fetchLatestTag(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     };
 }
 
+/// Counts calls to `checkForUpdates`, including ones the one-shot latch
+/// short-circuits. Exposed so tests can assert the library does not start an
+/// update check implicitly.
+pub var invocation_count: std.atomic.Value(usize) = .init(0);
+
 /// Checks for updates in a background thread (runs only once per process).
 /// Returns a thread handle so callers can optionally join during shutdown.
 /// Fails silently on errors (no internet, api limits, etc).
+///
+/// This performs network I/O, so it is never invoked implicitly by the
+/// library; a caller must ask for it. The returned thread borrows
+/// `allocator`, so join it before that allocator is destroyed.
 pub fn checkForUpdates(io: std.Io, allocator: std.mem.Allocator) ?std.Thread {
-    if (builtin.is_test) return null;
+    // Counted before the one-shot latch below, so a test can assert that the
+    // library never reaches here on its own regardless of test ordering.
+    _ = invocation_count.fetchAdd(1, .monotonic);
 
     update_check_mutex.lock(io) catch return null;
     defer update_check_mutex.unlock(io);
