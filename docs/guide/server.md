@@ -52,17 +52,29 @@ try server.run(io, allocator, .stdio);
 
 ### HTTP Transport
 
-For remote access:
+For local access over HTTP:
 
 ```zig
 try server.run(io, allocator, .{ .http = .{ .host = "127.0.0.1", .port = 8080 } });
 ```
 
-You can also bind custom domains/hosts and ports:
+Binding anything other than loopback is opt-in and must be authenticated,
+because an MCP server exposes every tool you have registered to whoever can
+reach the port:
 
 ```zig
-try server.run(io, allocator, .{ .http = .{ .host = "api.example.com", .port = 8443 } });
+try server.run(io, allocator, .{ .http = .{
+    .host = "0.0.0.0",
+    .port = 8443,
+    .allow_non_loopback = true,
+    .auth_token = my_secret, // at least 32 characters
+} });
 ```
+
+Clients must then send `Authorization: Bearer <token>` on every request;
+anything else is answered with `401`. A configuration that would expose tools
+without authentication is rejected before the listener is created, so the
+server refuses to start rather than starting insecurely.
 
 The HTTP mode accepts JSON-RPC POST requests at the root path.
 
