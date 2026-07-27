@@ -92,6 +92,61 @@ const HttpRequestTransport = struct {
 };
 
 /// Configuration for an MCP Server
+/// Answers a client request for a method outside the MCP specification.
+///
+/// The returned value becomes the JSON-RPC `result`. It must be allocated from
+/// `allocator`, which is the per-message arena and lives until the response has
+/// been serialized. Returning an error answers `-32603`.
+pub const MethodHandler = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!std.json.Value;
+
+/// Observes a client notification for a method outside the specification.
+pub const NotificationMethodHandler = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!void;
+
+fn RegistryEntry(comptime Handler: type) type {
+    return struct {
+        ctx: ?*anyopaque,
+        handler: Handler,
+    };
+}
+
+/// Methods the server answers itself. A registration may not shadow one:
+/// silently never being called is a far worse failure than being told no.
+const builtin_request_methods = [_][]const u8{
+    "initialize",
+    "ping",
+    "tools/list",
+    "tools/call",
+    "resources/list",
+    "resources/read",
+    "resources/templates/list",
+    "resources/subscribe",
+    "resources/unsubscribe",
+    "prompts/list",
+    "prompts/get",
+    "logging/setLevel",
+    "completion/complete",
+    "tasks/get",
+    "tasks/result",
+    "tasks/list",
+    "tasks/cancel",
+};
+
+const builtin_notification_methods = [_][]const u8{
+    "notifications/initialized",
+    "notifications/cancelled",
+    "notifications/roots/list_changed",
+};
+
 pub const ServerConfig = struct {
     name: []const u8,
     version: []const u8,
@@ -437,6 +492,10 @@ pub const Server = struct {
     terminated_sessions: std.StringHashMap(void),
     /// Insertion order for `terminated_sessions`, used to evict the oldest.
     terminated_order: std.ArrayList([]const u8) = .empty,
+    /// Handlers for methods outside the MCP specification, consulted only
+    /// after every built-in has declined. Keys are owned.
+    method_handlers: std.StringHashMap(RegistryEntry(MethodHandler)),
+    notification_method_handlers: std.StringHashMap(RegistryEntry(NotificationMethodHandler)),
     /// Single implicit session for stdio and custom transports, which carry
     /// exactly one client and have no way to convey a session id.
     implicit_session: Session,
@@ -481,6 +540,8 @@ pub const Server = struct {
             .sessions = .init(allocator),
             .terminated_sessions = .init(allocator),
             .implicit_session = .init(allocator),
+            .method_handlers = .init(allocator),
+            .notification_method_handlers = .init(allocator),
         };
     }
 
@@ -497,6 +558,12 @@ pub const Server = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit();
+        var method_keys = self.method_handlers.keyIterator();
+        while (method_keys.next()) |key| self.allocator.free(key.*);
+        self.method_handlers.deinit();
+        var notification_keys = self.notification_method_handlers.keyIterator();
+        while (notification_keys.next()) |key| self.allocator.free(key.*);
+        self.notification_method_handlers.deinit();
         for (self.terminated_order.items) |key| self.allocator.free(key);
         self.terminated_order.deinit(self.allocator);
         self.terminated_sessions.deinit();
@@ -620,6 +687,63 @@ pub const Server = struct {
     fn preferredProtocolVersion(self: *const Self) []const u8 {
         const versions = self.supportedProtocolVersions();
         return if (versions.len == 0) protocol.VERSION else versions[0];
+    }
+
+    /// Registers a handler for a request method outside the specification.
+    ///
+    /// Built-in methods may not be registered: a registration that silently
+    /// never runs is a worse outcome than being told no, so an attempt returns
+    /// `error.MethodReserved`. Registering the same custom method twice
+    /// replaces the previous handler.
+    pub fn onMethod(self: *Self, method: []const u8, ctx: ?*anyopaque, handler: MethodHandler) !void {
+        for (builtin_request_methods) |reserved| {
+            if (std.mem.eql(u8, reserved, method)) return error.MethodReserved;
+        }
+        try registerMethodHandler(MethodHandler, &self.method_handlers, self.allocator, method, ctx, handler);
+    }
+
+    /// Registers a handler for a notification method outside the specification.
+    pub fn onNotificationMethod(
+        self: *Self,
+        method: []const u8,
+        ctx: ?*anyopaque,
+        handler: NotificationMethodHandler,
+    ) !void {
+        for (builtin_notification_methods) |reserved| {
+            if (std.mem.eql(u8, reserved, method)) return error.MethodReserved;
+        }
+        try registerMethodHandler(
+            NotificationMethodHandler,
+            &self.notification_method_handlers,
+            self.allocator,
+            method,
+            ctx,
+            handler,
+        );
+    }
+
+    /// Whether a custom handler is registered for `method`.
+    pub fn hasMethodHandler(self: *const Self, method: []const u8) bool {
+        return self.method_handlers.contains(method);
+    }
+
+    fn registerMethodHandler(
+        comptime Handler: type,
+        map: *std.StringHashMap(RegistryEntry(Handler)),
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        ctx: ?*anyopaque,
+        handler: Handler,
+    ) !void {
+        // The caller's `method` may be a temporary, and the map outlives it.
+        const gop = try map.getOrPut(method);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = allocator.dupe(u8, method) catch |err| {
+                _ = map.remove(method);
+                return err;
+            };
+        }
+        gop.value_ptr.* = .{ .ctx = ctx, .handler = handler };
     }
 
     /// Whether a client-presented `MCP-Protocol-Version` is one we speak.
@@ -1881,6 +2005,21 @@ pub const Server = struct {
             try self.handleTasksList(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tasks/cancel")) {
             try self.handleTasksCancel(session, io, allocator, request);
+        } else if (self.method_handlers.get(request.method)) |entry| {
+            const result = entry.handler(entry.ctx, io, allocator, request.params) catch |err| {
+                var detail: [128]u8 = undefined;
+                const message = std.fmt.bufPrint(&detail, "Handler failed: {s}", .{@errorName(err)}) catch "Handler failed";
+                const error_response = jsonrpc.createErrorResponse(
+                    request.id,
+                    jsonrpc.ErrorCode.INTERNAL_ERROR,
+                    message,
+                    null,
+                );
+                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+                return;
+            };
+            const response = jsonrpc.createResponse(request.id, result);
+            try self.sendResponse(session, io, allocator, .{ .response = response });
         } else {
             const error_response = jsonrpc.createMethodNotFound(request.id, request.method);
             try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
@@ -2681,6 +2820,17 @@ pub const Server = struct {
             }
         } else if (std.mem.eql(u8, notification.method, "notifications/roots/list_changed")) {
             self.log(io, "Roots list changed");
+        } else if (self.notification_method_handlers.get(notification.method)) |entry| {
+            // A notification has no reply, so a failing handler can only be
+            // logged. Dropping the connection over it would be worse.
+            entry.handler(entry.ctx, io, self.allocator, notification.params) catch |err| {
+                var detail: [128]u8 = undefined;
+                if (std.fmt.bufPrint(&detail, "Notification handler failed: {s}", .{@errorName(err)})) |message| {
+                    self.logError(io, message);
+                } else |_| {
+                    self.logError(io, "Notification handler failed");
+                }
+            };
         }
     }
 
@@ -4223,4 +4373,139 @@ test "pinning without strict mode still negotiates down" {
     // newer revision.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"protocolVersion\":\"2025-06-18\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"error\"") == null);
+}
+
+const CustomMethodProbe = struct {
+    calls: usize = 0,
+    notified: usize = 0,
+    fail: bool = false,
+
+    fn shutdown(ctx: ?*anyopaque, _: std.Io, allocator: std.mem.Allocator, params: ?std.json.Value) anyerror!std.json.Value {
+        const self: *CustomMethodProbe = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        if (self.fail) return error.Refused;
+
+        var result: std.json.ObjectMap = .empty;
+        try result.put(allocator, "stopped", .{ .bool = true });
+        // Params reach the handler untouched.
+        if (params) |p| {
+            if (p == .object) {
+                if (p.object.get("reason")) |reason| try result.put(allocator, "reason", reason);
+            }
+        }
+        return .{ .object = result };
+    }
+
+    fn exit(ctx: ?*anyopaque, _: std.Io, _: std.mem.Allocator, _: ?std.json.Value) anyerror!void {
+        const self: *CustomMethodProbe = @ptrCast(@alignCast(ctx.?));
+        self.notified += 1;
+    }
+};
+
+test "a custom method is dispatched instead of answering method-not-found" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    var probe: CustomMethodProbe = .{};
+    try server.onMethod("shutdown", &probe, CustomMethodProbe.shutdown);
+    try std.testing.expect(server.hasMethodHandler("shutdown"));
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"shutdown","params":{"reason":"done"}}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stopped\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reason\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32601") == null);
+}
+
+test "an unregistered method still answers method-not-found" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"shutdown"}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32601") != null);
+}
+
+test "a failing custom handler answers -32603 rather than dropping the connection" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    var probe: CustomMethodProbe = .{ .fail = true };
+    try server.onMethod("shutdown", &probe, CustomMethodProbe.shutdown);
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"shutdown"}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32603") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Refused") != null);
+}
+
+test "a built-in method cannot be shadowed by a registration" {
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    var probe: CustomMethodProbe = .{};
+    try std.testing.expectError(error.MethodReserved, server.onMethod("tools/call", &probe, CustomMethodProbe.shutdown));
+    try std.testing.expectError(error.MethodReserved, server.onMethod("initialize", &probe, CustomMethodProbe.shutdown));
+    try std.testing.expectError(
+        error.MethodReserved,
+        server.onNotificationMethod("notifications/initialized", &probe, CustomMethodProbe.exit),
+    );
+    try std.testing.expect(!server.hasMethodHandler("tools/call"));
+}
+
+test "a custom notification reaches its handler and produces no reply" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    var probe: CustomMethodProbe = .{};
+    try server.onNotificationMethod("exit", &probe, CustomMethodProbe.exit);
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"exit"}
+    );
+    defer reply.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.notified);
+    try std.testing.expectEqual(@as(usize, 0), reply.messages.len);
+}
+
+test "registering a custom method twice replaces the handler without leaking the key" {
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    var first: CustomMethodProbe = .{};
+    var second: CustomMethodProbe = .{};
+    try server.onMethod("shutdown", &first, CustomMethodProbe.shutdown);
+    try server.onMethod("shutdown", &second, CustomMethodProbe.shutdown);
+    try std.testing.expectEqual(@as(usize, 1), server.method_handlers.count());
+    try std.testing.expectEqual(@as(?*anyopaque, &second), server.method_handlers.get("shutdown").?.ctx);
 }
