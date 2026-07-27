@@ -35,6 +35,67 @@ pub const ClientConfig = struct {
     server_stderr: std.process.SpawnOptions.StdIo = .ignore,
 };
 
+/// A single environment variable passed to a spawned server.
+pub const EnvVar = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Controls how `connectStdioOptions` spawns the server process.
+pub const StdioOptions = struct {
+    args: []const []const u8 = &.{},
+    /// Variables layered on top of `base_environ`. A name already present
+    /// there is overwritten.
+    env: []const EnvVar = &.{},
+    /// The environment the child starts from.
+    ///
+    /// Pass `init.environ_map` from `std.process.Init` to build on this
+    /// process's environment. std does not expose the environment as a global
+    /// in 0.16 -- it is handed to `main` -- so a caller that wants to *add* to
+    /// the inherited environment has to supply it here.
+    ///
+    /// Null plus `inherit_environ = true` (the defaults) leaves the
+    /// inheritance to the OS, which is what plain `connectStdio` does.
+    base_environ: ?*const std.process.Environ.Map = null,
+    /// When false the child receives only `base_environ` + `env`.
+    ///
+    /// Set this to false to withhold the parent's environment: a server you
+    /// did not write should not automatically receive every secret the host
+    /// happens to hold.
+    inherit_environ: bool = true,
+    /// Working directory for the child. Defaults to inheriting the parent's.
+    /// Accepts either a path or an open directory handle.
+    cwd: std.process.Child.Cwd = .inherit,
+};
+
+/// Builds the environment block for a spawned server, or null to let the OS
+/// inherit the parent's.
+fn buildEnvironMap(
+    allocator: std.mem.Allocator,
+    options: StdioOptions,
+) !?std.process.Environ.Map {
+    if (options.inherit_environ and options.env.len == 0 and options.base_environ == null) {
+        return null;
+    }
+
+    var map: std.process.Environ.Map = .init(allocator);
+    errdefer map.deinit();
+
+    if (options.base_environ) |base| {
+        for (base.keys(), base.values()) |name, value| {
+            try map.put(name, value);
+        }
+    }
+
+    for (options.env) |v| {
+        if (!std.process.Environ.Map.validateKeyForPut(v.name)) {
+            return error.InvalidEnvironmentVariableName;
+        }
+        try map.put(v.name, v.value);
+    }
+    return map;
+}
+
 /// A successful JSON-RPC response.
 ///
 /// `result` is a view into `parsed`, so it is only valid until `deinit`.
@@ -212,20 +273,42 @@ pub const Client = struct {
     }
 
     /// Connects to a server by spawning a process and communicating via STDIO.
+    ///
+    /// The child inherits this process's environment and working directory.
+    /// Use `connectStdioOptions` to control either.
     pub fn connectStdio(self: *Self, io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) !void {
+        return self.connectStdioOptions(io, allocator, command, .{ .args = args });
+    }
+
+    /// Connects to a server by spawning a process, with control over the
+    /// child's environment and working directory.
+    pub fn connectStdioOptions(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        command: []const u8,
+        options: StdioOptions,
+    ) !void {
         self.state = .connecting;
         errdefer self.state = .error_state;
 
-        const argv = try allocator.alloc([]const u8, args.len + 1);
+        const argv = try allocator.alloc([]const u8, options.args.len + 1);
         defer allocator.free(argv);
         argv[0] = command;
-        @memcpy(argv[1..], args);
+        @memcpy(argv[1..], options.args);
+
+        var environ_map = try buildEnvironMap(allocator, options);
+        // The block is copied into the child at spawn time, so the map is only
+        // needed for the duration of the call.
+        defer if (environ_map) |*m| m.deinit();
 
         var child = try std.process.spawn(io, .{
             .argv = argv,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = self.config.server_stderr,
+            .environ_map = if (environ_map) |*m| m else null,
+            .cwd = options.cwd,
         });
         errdefer child.kill(io);
 
@@ -794,4 +877,113 @@ test "a server error surfaces as an error with its code and message" {
     try std.testing.expectError(error.ServerError, client.callTool(io, allocator, "no-such-tool", null));
     try std.testing.expect(client.last_error != null);
     try std.testing.expect(client.last_error.?.message.len > 0);
+}
+
+/// Calls a single-string-argument tool on the probe server and returns the
+/// text of the first content block. Caller owns the returned slice.
+fn probeCall(
+    client: *Client,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tool: []const u8,
+    arg_name: []const u8,
+    arg_value: []const u8,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var args: std.json.ObjectMap = .empty;
+    try args.put(arena.allocator(), arg_name, .{ .string = arg_value });
+
+    const result = try client.callTool(io, allocator, tool, .{ .object = args });
+    defer result.deinit();
+    return allocator.dupe(u8, result.get("content").?.array.items[0].object.get("text").?.string);
+}
+
+test "connectStdioOptions passes env vars through to the child process" {
+    const build_options = @import("build_options");
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+
+    try client.connectStdioOptions(io, allocator, build_options.env_probe_server_path, .{
+        .env = &.{.{ .name = "MCP_ZIG_PROBE", .value = "handed-over" }},
+    });
+
+    const value = try probeCall(&client, io, allocator, "getenv", "name", "MCP_ZIG_PROBE");
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("handed-over", value);
+}
+
+test "connectStdioOptions can withhold the parent environment" {
+    // A server you did not write should not automatically receive every
+    // variable the host happens to hold.
+    const build_options = @import("build_options");
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+
+    try client.connectStdioOptions(io, allocator, build_options.env_probe_server_path, .{
+        .inherit_environ = false,
+        .env = &.{.{ .name = "MCP_ZIG_ONLY", .value = "1" }},
+    });
+
+    const kept = try probeCall(&client, io, allocator, "getenv", "name", "MCP_ZIG_ONLY");
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("1", kept);
+
+    // PATH is set for essentially every test runner, and it is not in `env`.
+    const dropped = try probeCall(&client, io, allocator, "getenv", "name", "PATH");
+    defer allocator.free(dropped);
+    try std.testing.expectEqualStrings("<unset>", dropped);
+}
+
+test "connectStdioOptions sets the child's working directory" {
+    const build_options = @import("build_options");
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "marker.txt", .data = "in-the-right-place" });
+
+    // The build option is relative to the build root, and the child resolves
+    // argv[0] *after* changing directory, so it has to be absolute here.
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buf);
+    const server_path = try std.fs.path.resolve(allocator, &.{
+        cwd_buf[0..cwd_len],
+        build_options.env_probe_server_path,
+    });
+    defer allocator.free(server_path);
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+
+    try client.connectStdioOptions(io, allocator, server_path, .{
+        .cwd = .{ .dir = tmp.dir },
+    });
+
+    const contents = try probeCall(&client, io, allocator, "read_relative", "path", "marker.txt");
+    defer allocator.free(contents);
+    try std.testing.expectEqualStrings("in-the-right-place", contents);
+}
+
+test "an environment variable name containing '=' is rejected" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidEnvironmentVariableName, buildEnvironMap(allocator, .{
+        .env = &.{.{ .name = "BAD=NAME", .value = "x" }},
+    }));
 }

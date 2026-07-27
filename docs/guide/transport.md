@@ -25,6 +25,32 @@ try server.run(io, allocator, .stdio);
 try client.connectStdio(io, allocator, "./my-server", &.{});
 ```
 
+The child inherits this process's environment and working directory. Use
+`connectStdioOptions` to control either:
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    // ...
+    try client.connectStdioOptions(io, allocator, "./my-server", .{
+        .args = &.{"--verbose"},
+        // Layered on top of `base_environ`.
+        .env = &.{.{ .name = "API_KEY", .value = secret }},
+        // std hands the environment to `main`; it is not a global, so pass it
+        // in if you want the child to build on it.
+        .base_environ = init.environ_map,
+        .cwd = .{ .path = "/srv/project" },
+    });
+}
+```
+
+Set `inherit_environ = false` (and leave `base_environ` null) to give the
+child *only* the variables in `env`. That is the right default for a server
+you did not write: otherwise it receives every secret the host happens to
+hold, including credentials intended for a different server.
+
+Note that `argv[0]` is resolved by the child *after* it changes directory, so
+pass an absolute path for the command whenever you set `cwd`.
+
 ### How It Works
 
 1. Client spawns the server as a child process
