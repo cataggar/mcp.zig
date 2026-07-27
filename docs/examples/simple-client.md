@@ -46,7 +46,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, process_args: std.process.Args)
         .version = "1.0.0",
         .title = "Simple MCP Client",
     });
-    defer client.deinit(allocator);
+    defer client.deinit(io, allocator);
 
     // Enable capabilities
     client.enableSamplingAdvanced(true, true);
@@ -65,9 +65,13 @@ fn run(io: std.Io, allocator: std.mem.Allocator, process_args: std.process.Args)
     std.debug.print("Roots configured: {d}\n", .{client.roots_list.items.len});
 
     // In a real implementation, you would:
-    // 1. Connect to server: try client.connectStdio(io, allocator, server_command.?, &.{});
-    // 2. List tools: try client.listTools(io, allocator);
-    // 3. Call tools: try client.callTool(io, allocator, "greet", args);
+    try client.connectStdio(io, allocator, server_command.?, &.{});
+
+    const tools = try client.listTools(io, allocator);
+    defer tools.deinit();
+
+    const result = try client.callTool(io, allocator, "greet", args);
+    defer result.deinit();
     // 4. Handle responses in an event loop
 
     std.debug.print("\nTo connect to a server, run:\n", .{});
