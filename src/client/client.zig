@@ -1794,3 +1794,82 @@ test "a stdio server that dies mid-handshake is torn down exactly once" {
     try std.testing.expect(client.transport == null);
     try std.testing.expect(client.child == null);
 }
+
+test "a client drives a real server over the http transport" {
+    // The server and the client had only ever been tested apart: every http
+    // server test called `handleMessage` directly, so nothing exercised a
+    // request that actually crossed a socket.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server_mod = @import("../server/server.zig");
+    const tools_mod = @import("../server/tools.zig");
+
+    var server: server_mod.Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    const handlers = struct {
+        fn ping(
+            _: ?*anyopaque,
+            _: std.Io,
+            allocator: std.mem.Allocator,
+            args: ?std.json.Value,
+        ) tools_mod.ToolError!tools_mod.ToolResult {
+            const message = tools_mod.getString(args, "message") orelse "pong";
+            return tools_mod.textResult(allocator, message) catch return error.OutOfMemory;
+        }
+    };
+    try server.addTool(.{
+        .name = "ping",
+        .description = "Echo the supplied message",
+        .inputSchema = null,
+        .handler = handlers.ping,
+    });
+
+    // A fixed port, because `shutdown` wakes the accept loop by dialing the
+    // listener and port 0 gives it nothing to dial.
+    const port: u16 = 47941;
+    const runner = struct {
+        fn run(s: *server_mod.Server, run_io: std.Io, allocator: std.mem.Allocator, p: u16) void {
+            s.run(run_io, allocator, .{ .http = .{ .port = p, .shutdown_grace_ms = 200 } }) catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, runner.run, .{ &server, io, std.testing.allocator, port });
+    defer {
+        server.shutdown(io);
+        thread.join();
+    }
+
+    var spins: usize = 0;
+    while (spins < 1000) : (spins += 1) {
+        server.connections_mutex.lock(io) catch unreachable;
+        const listening = server.http_listener != null;
+        server.connections_mutex.unlock(io);
+        if (listening) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(spins < 1000);
+
+    var client: Client = .init(io, std.testing.allocator, .{ .name = "c", .version = "1" });
+    defer client.deinit(io, std.testing.allocator);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    try client.connectHttp(io, std.testing.allocator, url);
+
+    const listed = try client.listTools(io, std.testing.allocator, .{});
+    defer listed.deinit();
+    const tools = listed.result.object.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 1), tools.items.len);
+    try std.testing.expectEqualStrings("ping", tools.items[0].object.get("name").?.string);
+
+    var arguments: std.json.ObjectMap = .empty;
+    defer arguments.deinit(std.testing.allocator);
+    try arguments.put(std.testing.allocator, "message", .{ .string = "over-the-wire" });
+
+    const called = try client.callTool(io, std.testing.allocator, "ping", .{ .object = arguments });
+    defer called.deinit();
+    const content = called.result.object.get("content").?.array;
+    try std.testing.expectEqualStrings("over-the-wire", content.items[0].object.get("text").?.string);
+}
