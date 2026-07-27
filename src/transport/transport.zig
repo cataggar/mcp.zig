@@ -62,11 +62,27 @@ pub const Transport = struct {
 /// STDIO transport for local process communication.
 /// Messages are delimited by newlines and sent via stdin/stdout.
 pub const StdioTransport = struct {
+    /// Bytes pulled off the stream but not yet returned as a message. A
+    /// buffered read can cross a newline, so the tail is kept here for the
+    /// next `receive` rather than being re-read (it cannot be un-read).
     read_buffer: std.ArrayList(u8) = .empty,
     is_closed: bool = false,
+    /// Set once the stream reports EOF, so a trailing message with no final
+    /// newline is still delivered before `EndOfStream` is reported.
+    at_end: bool = false,
     max_message_size: usize = 4 * 1024 * 1024,
+    /// Stream to read messages from. `null` means this process's stdin, which
+    /// is what a server wants. A client that spawns a server points this at
+    /// the child's stdout instead.
+    in: ?std.Io.File = null,
+    /// Stream to write messages to. `null` means this process's stdout.
+    out: ?std.Io.File = null,
 
     const Self = @This();
+
+    /// Size of a single read syscall. Reading a byte at a time cost one
+    /// syscall per byte, which dominated the cost of receiving a message.
+    const read_chunk_size = 64 * 1024;
 
     /// Releases resources held by the transport.
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -77,9 +93,9 @@ pub const StdioTransport = struct {
     pub fn send(self: *Self, io: std.Io, _: std.mem.Allocator, message: []const u8) Transport.SendError!void {
         if (self.is_closed) return Transport.SendError.ConnectionClosed;
 
-        const stdout = std.Io.File.stdout();
-        stdout.writeStreamingAll(io, message) catch return Transport.SendError.WriteError;
-        stdout.writeStreamingAll(io, "\n") catch return Transport.SendError.WriteError;
+        const out = self.out orelse std.Io.File.stdout();
+        out.writeStreamingAll(io, message) catch return Transport.SendError.WriteError;
+        out.writeStreamingAll(io, "\n") catch return Transport.SendError.WriteError;
     }
 
     /// Sends a JSON-RPC message object.
@@ -89,45 +105,74 @@ pub const StdioTransport = struct {
         try self.send(io, allocator, json);
     }
 
-    /// Receives a JSON-RPC message from stdin (reads until newline).
+    /// Removes and returns the next newline-delimited message already sitting
+    /// in `read_buffer`, or null if it does not yet hold a whole one.
+    fn takeBufferedMessage(self: *Self, allocator: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+        const idx = std.mem.indexOfScalar(u8, self.read_buffer.items, '\n') orelse return null;
+        const message = try allocator.dupe(u8, self.read_buffer.items[0..idx]);
+        const rest_start = idx + 1;
+        const rest_len = self.read_buffer.items.len - rest_start;
+        std.mem.copyForwards(u8, self.read_buffer.items[0..rest_len], self.read_buffer.items[rest_start..]);
+        self.read_buffer.shrinkRetainingCapacity(rest_len);
+        return message;
+    }
+
+    /// Receives a newline-delimited JSON-RPC message from the input stream.
     pub fn receive(self: *Self, io: std.Io, allocator: std.mem.Allocator) Transport.ReceiveError!?[]const u8 {
         if (self.is_closed) return Transport.ReceiveError.ConnectionClosed;
 
-        self.read_buffer.clearRetainingCapacity();
+        if (try self.takeBufferedMessage(allocator)) |message| {
+            if (message.len == 0) {
+                allocator.free(message);
+                return null;
+            }
+            return message;
+        }
 
-        const stdin = std.Io.File.stdin();
+        const in = self.in orelse std.Io.File.stdin();
 
         while (true) {
-            var buf: [1]u8 = undefined;
-            const bytes_read = stdin.readStreaming(io, &.{&buf}) catch return Transport.ReceiveError.ReadError;
-
-            if (bytes_read == 0) {
-                if (self.read_buffer.items.len == 0) {
-                    return Transport.ReceiveError.EndOfStream;
-                }
-                break;
+            if (self.at_end) {
+                // A final message with no trailing newline is still a message.
+                if (self.read_buffer.items.len == 0) return Transport.ReceiveError.EndOfStream;
+                const message = allocator.dupe(u8, self.read_buffer.items) catch {
+                    return Transport.ReceiveError.OutOfMemory;
+                };
+                self.read_buffer.clearRetainingCapacity();
+                return message;
             }
 
-            const byte = buf[0];
-            if (byte == '\n') {
-                break;
-            }
+            var chunk: [read_chunk_size]u8 = undefined;
+            // End of stream is reported as an error, not as a zero-length
+            // read; the previous implementation mapped it to `ReadError` and
+            // so never reported `EndOfStream` at all. A zero-length read is
+            // also legal and does not mean the stream ended.
+            const bytes_read = in.readStreaming(io, &.{&chunk}) catch |err| switch (err) {
+                error.EndOfStream => {
+                    self.at_end = true;
+                    continue;
+                },
+                else => return Transport.ReceiveError.ReadError,
+            };
+            if (bytes_read == 0) continue;
 
-            if (self.read_buffer.items.len >= self.max_message_size) {
+            // No newline is in the buffer at this point, so everything held is
+            // one unterminated message and the cap applies to all of it.
+            if (self.read_buffer.items.len + bytes_read > self.max_message_size) {
                 return Transport.ReceiveError.MessageTooLarge;
             }
+            self.read_buffer.appendSlice(allocator, chunk[0..bytes_read]) catch {
+                return Transport.ReceiveError.OutOfMemory;
+            };
 
-            self.read_buffer.append(allocator, byte) catch return Transport.ReceiveError.OutOfMemory;
+            if (try self.takeBufferedMessage(allocator)) |message| {
+                if (message.len == 0) {
+                    allocator.free(message);
+                    return null;
+                }
+                return message;
+            }
         }
-
-        if (self.read_buffer.items.len == 0) {
-            return null;
-        }
-
-        const result = allocator.dupe(u8, self.read_buffer.items) catch {
-            return Transport.ReceiveError.OutOfMemory;
-        };
-        return result;
     }
 
     /// Closes the transport.
@@ -696,4 +741,101 @@ test "Client.connectHttp round-trips and frees everything it allocates" {
     try std.testing.expectEqual(@as(usize, 2), origin.requestCount());
     // The handshake response carried a session id; the next request replays it.
     try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[1], "mcp-session-id: issued-session") != null);
+}
+
+fn stdioFromFixture(dir: std.Io.Dir, io: std.Io, name: []const u8, contents: []const u8) !std.Io.File {
+    const w = try dir.createFile(io, name, .{});
+    try w.writeStreamingAll(io, contents);
+    w.close(io);
+    return try dir.openFile(io, name, .{});
+}
+
+test "stdio receive buffers ahead instead of reading a byte at a time" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const in = try stdioFromFixture(tmp.dir, io, "in.jsonl", "one\ntwo\n");
+    defer in.close(io);
+
+    var t: StdioTransport = .{ .in = in };
+    defer t.deinit(allocator);
+
+    const first = (try t.receive(io, allocator)).?;
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("one", first);
+
+    // The byte-at-a-time reader stopped exactly at the newline, so it never
+    // held anything after returning a message. A buffered read pulls the rest
+    // of the chunk too, which is the whole point of the fix.
+    try std.testing.expect(t.read_buffer.items.len > 0);
+
+    const second = (try t.receive(io, allocator)).?;
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("two", second);
+
+    try std.testing.expectError(Transport.ReceiveError.EndOfStream, t.receive(io, allocator));
+}
+
+test "stdio receive delivers a trailing message that has no newline" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const in = try stdioFromFixture(tmp.dir, io, "in.jsonl", "solo");
+    defer in.close(io);
+
+    var t: StdioTransport = .{ .in = in };
+    defer t.deinit(allocator);
+
+    const msg = (try t.receive(io, allocator)).?;
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("solo", msg);
+    try std.testing.expectError(Transport.ReceiveError.EndOfStream, t.receive(io, allocator));
+}
+
+test "stdio receive rejects a message larger than the cap" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const in = try stdioFromFixture(tmp.dir, io, "in.jsonl", "0123456789abcdef\n");
+    defer in.close(io);
+
+    var t: StdioTransport = .{ .in = in, .max_message_size = 8 };
+    defer t.deinit(allocator);
+
+    try std.testing.expectError(Transport.ReceiveError.MessageTooLarge, t.receive(io, allocator));
+}
+
+test "stdio send writes to the configured stream, not this process's stdout" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out = try tmp.dir.createFile(io, "out.jsonl", .{});
+    var t: StdioTransport = .{ .out = out };
+    defer t.deinit(allocator);
+    try t.send(io, allocator, "{\"jsonrpc\":\"2.0\"}");
+    out.close(io);
+
+    const written = try tmp.dir.readFileAlloc(io, "out.jsonl", allocator, .limited(1024));
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\"}\n", written);
 }
