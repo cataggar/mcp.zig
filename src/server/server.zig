@@ -11,6 +11,7 @@ const http = std.http;
 const jsonrpc = @import("../protocol/jsonrpc.zig");
 const protocol = @import("../protocol/protocol.zig");
 const types = @import("../protocol/types.zig");
+const RequestContext = @import("request.zig").RequestContext;
 const transport_mod = @import("../transport/transport.zig");
 const prompts_mod = @import("prompts.zig");
 const resources_mod = @import("resources.zig");
@@ -327,11 +328,12 @@ pub const Session = struct {
     tasks: std.StringHashMap(TaskEntry),
     pending_requests: std.AutoHashMap(i64, PendingRequest),
     next_request_id: i64 = 1,
-    /// Ids of client requests currently being served, so a repeat can be
-    /// rejected while the original is still outstanding. Keys are owned and
+    /// Client requests currently being served, so a repeat can be rejected
+    /// while the original is still outstanding and `notifications/cancelled`
+    /// can reach the handler that is running. Keys and contexts are owned and
     /// dropped as soon as the response is sent, so this holds only genuinely
     /// concurrent work rather than growing for the life of the session.
-    inflight: std.StringHashMap(void),
+    inflight: std.StringHashMap(*RequestContext),
     /// Guards `inflight`. Requests on one session are serialized today, but
     /// the table is the seam a worker pool would contend on.
     inflight_mutex: std.Io.Mutex = .init,
@@ -357,31 +359,42 @@ pub const Session = struct {
         };
     }
 
-    const Claim = enum { claimed, duplicate, at_capacity };
+    const Claim = union(enum) {
+        /// The context is owned by the session until `releaseRequestId`.
+        claimed: *RequestContext,
+        duplicate,
+        at_capacity,
+    };
 
     /// Take ownership of a request id for the duration of the request.
     ///
-    /// The key is allocated from the session's own allocator, not from the
-    /// caller's: the per-message allocator is an arena that is destroyed long
-    /// before a concurrent request could observe the entry.
+    /// The key and context are allocated from the session's own allocator, not
+    /// from the caller's: the per-message allocator is an arena that is
+    /// destroyed long before a concurrent request could observe the entry.
     fn claimRequestId(self: *Session, io: std.Io, id: types.RequestId) !Claim {
         const allocator = self.inflight.allocator;
         const key = try inflightKey(allocator, id);
         errdefer allocator.free(key);
+
+        const context = try allocator.create(RequestContext);
+        errdefer allocator.destroy(context);
+        context.* = .{};
 
         self.inflight_mutex.lock(io) catch return error.Canceled;
         defer self.inflight_mutex.unlock(io);
 
         if (self.inflight.contains(key)) {
             allocator.free(key);
+            allocator.destroy(context);
             return .duplicate;
         }
         if (self.inflight.count() >= max_inflight_requests) {
             allocator.free(key);
+            allocator.destroy(context);
             return .at_capacity;
         }
-        try self.inflight.put(key, {});
-        return .claimed;
+        try self.inflight.put(key, context);
+        return .{ .claimed = context };
     }
 
     fn releaseRequestId(self: *Session, io: std.Io, id: types.RequestId) void {
@@ -392,7 +405,37 @@ pub const Session = struct {
         self.inflight_mutex.lockUncancelable(io);
         defer self.inflight_mutex.unlock(io);
 
-        if (self.inflight.fetchRemove(key)) |entry| allocator.free(entry.key);
+        if (self.inflight.fetchRemove(key)) |entry| {
+            allocator.free(entry.key);
+            allocator.destroy(entry.value);
+        }
+    }
+
+    /// Asks the handler serving `id`, if any, to stop.
+    ///
+    /// Returns whether a matching request was in flight, which is the only way
+    /// the caller can tell a cancellation that arrived in time from one that
+    /// raced the response.
+    fn cancelRequestId(self: *Session, io: std.Io, id: types.RequestId) bool {
+        const allocator = self.inflight.allocator;
+        const key = inflightKey(allocator, id) catch return false;
+        defer allocator.free(key);
+
+        self.inflight_mutex.lockUncancelable(io);
+        defer self.inflight_mutex.unlock(io);
+
+        const context = self.inflight.get(key) orelse return false;
+        context.cancel();
+        return true;
+    }
+
+    /// Asks every handler running on this session to stop.
+    fn cancelAllRequests(self: *Session, io: std.Io) void {
+        self.inflight_mutex.lockUncancelable(io);
+        defer self.inflight_mutex.unlock(io);
+
+        var it = self.inflight.valueIterator();
+        while (it.next()) |context| context.*.cancel();
     }
 
     /// Whether work for this session should stop early, because the client
@@ -441,8 +484,11 @@ pub const Session = struct {
         }
         self.tasks.deinit();
         self.pending_requests.deinit();
-        var inflight_it = self.inflight.keyIterator();
-        while (inflight_it.next()) |key| allocator.free(key.*);
+        var inflight_it = self.inflight.iterator();
+        while (inflight_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.destroy(entry.value_ptr.*);
+        }
         self.inflight.deinit();
         self.deinitReplay(allocator);
         if (self.client_info) |ci| {
@@ -656,6 +702,49 @@ pub const Server = struct {
         try out.appendSlice(allocator, "\n");
     }
 
+    /// Answers a request whose handler stopped because it was cancelled.
+    fn sendRequestCancelled(
+        self: *Self,
+        session: *Session,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        request: jsonrpc.Request,
+    ) !void {
+        const error_response = jsonrpc.createErrorResponse(
+            request.id,
+            jsonrpc.ErrorCode.REQUEST_CANCELLED,
+            "Request cancelled",
+            null,
+        );
+        try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+    }
+
+    /// Whether `body` is a `notifications/cancelled`.
+    ///
+    /// The substring test comes first so the common case does not pay for a
+    /// second parse: a body that never mentions the method cannot be one.
+    fn isCancellationMessage(allocator: std.mem.Allocator, body: []const u8) bool {
+        if (std.mem.indexOf(u8, body, "notifications/cancelled") == null) return false;
+        const parsed = jsonrpc.parseMessage(allocator, body) catch return false;
+        defer parsed.deinit();
+        return switch (parsed.message) {
+            .notification => |notification| std.mem.eql(u8, notification.method, "notifications/cancelled"),
+            else => false,
+        };
+    }
+
+    /// The `requestId` a `notifications/cancelled` refers to, if it is usable.
+    fn cancelledRequestId(notification: jsonrpc.Notification) ?types.RequestId {
+        const params = notification.params orelse return null;
+        if (params != .object) return null;
+        const value = params.object.get("requestId") orelse return null;
+        return switch (value) {
+            .string => |text| .{ .string = text },
+            .integer => |number| .{ .integer = number },
+            else => null,
+        };
+    }
+
     /// The `protocolVersion` a client asked for in `initialize`, if any.
     fn requestedProtocolVersion(request: jsonrpc.Request) ?[]const u8 {
         const params = request.params orelse return null;
@@ -843,6 +932,7 @@ pub const Server = struct {
             if (session.refs > 0) {
                 session.closing = true;
                 session.cancel_requested = true;
+                session.cancelAllRequests(io);
                 _ = self.sessions.remove(session.id.?);
                 self.recordTerminated(session.id.?);
                 continue;
@@ -1438,6 +1528,7 @@ pub const Server = struct {
                 // Still in use: unpublish now, tear down on last release.
                 session.closing = true;
                 session.cancel_requested = true;
+                session.cancelAllRequests(io);
                 _ = self.sessions.remove(session.id.?);
                 self.recordTerminated(session.id.?);
             } else {
@@ -1694,6 +1785,23 @@ pub const Server = struct {
             session = created.session;
         }
 
+        // A cancellation must not queue behind the request it is trying to
+        // stop. The session mutex is held for a whole exchange, so dispatching
+        // this the ordinary way would deliver it only once the handler had
+        // already finished — which is exactly never in time. The table it
+        // touches is guarded by `inflight_mutex`, not by the session mutex.
+        if (isCancellationMessage(allocator, body_items)) {
+            self.handleMessage(session, io, allocator, body_items) catch {};
+            try request.respond("", .{
+                .status = .accepted,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                    .{ .name = "MCP-Protocol-Version", .value = negotiated_version },
+                },
+            });
+            return;
+        }
+
         var request_transport: HttpRequestTransport = .{ .owner_allocator = allocator };
         defer request_transport.deinit();
 
@@ -1803,7 +1911,7 @@ pub const Server = struct {
 
         pub fn deinit(self: Reply) void {
             for (self.messages) |message| self.allocator.free(message);
-            self.allocator.free(self.messages);
+            if (self.messages.len != 0) self.allocator.free(self.messages);
         }
 
         /// The response to a request, which is the last message produced.
@@ -1831,6 +1939,16 @@ pub const Server = struct {
         message: []const u8,
     ) !Reply {
         const session = &self.implicit_session;
+
+        // A cancellation is dispatched without the session mutex, for the same
+        // reason as on the http path: the mutex is held for the whole of the
+        // request being cancelled, so waiting for it would deliver the
+        // cancellation only after the handler had already finished. A
+        // notification produces no reply, so there is nothing to capture.
+        if (isCancellationMessage(allocator, message)) {
+            try self.handleMessage(session, io, allocator, message);
+            return .{ .allocator = allocator, .messages = &.{} };
+        }
 
         var capture: HttpRequestTransport = .{ .owner_allocator = allocator };
         errdefer capture.deinit();
@@ -1926,8 +2044,8 @@ pub const Server = struct {
 
         // JSON-RPC ids identify an exchange, so accepting a repeat while the
         // original is outstanding would make the two responses ambiguous.
-        switch (try session.claimRequestId(io, request.id)) {
-            .claimed => {},
+        const request_context = switch (try session.claimRequestId(io, request.id)) {
+            .claimed => |context| context,
             .duplicate => {
                 const error_response = jsonrpc.createErrorResponse(
                     request.id,
@@ -1948,7 +2066,7 @@ pub const Server = struct {
                 try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
                 return;
             },
-        }
+        };
         defer session.releaseRequestId(io, request.id);
 
         if (std.mem.eql(u8, request.method, "initialize")) {
@@ -1963,7 +2081,7 @@ pub const Server = struct {
                 else => |e| return e,
             };
         } else if (std.mem.eql(u8, request.method, "tools/call")) {
-            try self.handleToolsCall(session, io, allocator, request);
+            try self.handleToolsCall(session, io, allocator, request, request_context);
         } else if (std.mem.eql(u8, request.method, "resources/list")) {
             self.handleResourcesList(session, io, allocator, request) catch |err| switch (err) {
                 // A cursor the client did not get from us is bad input, not a
@@ -2247,7 +2365,14 @@ pub const Server = struct {
     }
 
     /// Handle tools/call request
-    fn handleToolsCall(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleToolsCall(
+        self: *Self,
+        session: *Session,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        request: jsonrpc.Request,
+        request_context: *const RequestContext,
+    ) !void {
         var tool_name: []const u8 = "";
         var arguments: ?std.json.Value = null;
         var task_meta: ?types.TaskMetadata = null;
@@ -2302,7 +2427,7 @@ pub const Server = struct {
                     try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
                     return;
                 }
-                const tool_result: tools_mod.ToolResult = tool.handler(tool.user_data, io, allocator, arguments) catch |err| blk: {
+                const tool_result: tools_mod.ToolResult = tool.invoke(io, allocator, arguments, request_context) catch |err| blk: {
                     const msg = try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
                     status_message = msg;
                     var content = try self.allocator.alloc(types.ContentBlock, 1);
@@ -2336,7 +2461,11 @@ pub const Server = struct {
                 return;
             }
 
-            const tool_result = tool.handler(tool.user_data, io, allocator, arguments) catch |err| {
+            const tool_result = tool.invoke(io, allocator, arguments, request_context) catch |err| {
+                if (request_context.isCancelled()) {
+                    try self.sendRequestCancelled(session, io, allocator, request);
+                    return;
+                }
                 var content = try allocator.alloc(types.ContentBlock, 1);
                 content[0] = .{ .text = .{ .text = @errorName(err) } };
                 const result_value = try buildToolCallResultValue(allocator, .{ .content = content, .is_error = true });
@@ -2344,6 +2473,14 @@ pub const Server = struct {
                 try self.sendResponse(session, io, allocator, .{ .response = response });
                 return;
             };
+
+            // A handler that noticed the cancellation and returned early has
+            // nothing worth reporting, so say why rather than shipping a
+            // half-finished result the client already stopped waiting for.
+            if (request_context.isCancelled()) {
+                try self.sendRequestCancelled(session, io, allocator, request);
+                return;
+            }
 
             const result_value = try buildToolCallResultValue(allocator, tool_result);
             const response = jsonrpc.createResponse(request.id, result_value);
@@ -2811,11 +2948,14 @@ pub const Server = struct {
             session.state = .ready;
             self.log(io, "Server initialized and ready");
         } else if (std.mem.eql(u8, notification.method, "notifications/cancelled")) {
-            if (notification.params) |params| {
-                if (params == .object) {
-                    if (params.object.get("requestId")) |req_id| {
-                        _ = req_id;
-                    }
+            if (cancelledRequestId(notification)) |id| {
+                if (session.cancelRequestId(io, id)) {
+                    self.log(io, "Cancelled a request in flight");
+                } else {
+                    // The response was already on its way, or the id was never
+                    // ours. Either way there is nothing to stop and, per spec,
+                    // nothing to say about it.
+                    self.log(io, "Cancellation for a request that is not in flight");
                 }
             }
         } else if (std.mem.eql(u8, notification.method, "notifications/roots/list_changed")) {
@@ -4213,7 +4353,7 @@ test "a repeated request id is rejected while the original is in flight" {
 
     // Stand in for a request that is still being served.
     const claim = try server.implicit_session.claimRequestId(io, .{ .integer = 1 });
-    try std.testing.expectEqual(Session.Claim.claimed, claim);
+    try std.testing.expect(claim == .claimed);
 
     const clash = try server.handleMessageAlloc(io, std.testing.allocator,
         \\{"jsonrpc":"2.0","id":1,"method":"ping"}
@@ -4262,7 +4402,7 @@ test "integer and string request ids with the same digits do not collide" {
     defer server.deinit();
     try testInitialize(&server, io);
 
-    try std.testing.expectEqual(Session.Claim.claimed, try server.implicit_session.claimRequestId(io, .{ .integer = 5 }));
+    try std.testing.expect(try server.implicit_session.claimRequestId(io, .{ .integer = 5 }) == .claimed);
     defer server.implicit_session.releaseRequestId(io, .{ .integer = 5 });
 
     const reply = try server.handleMessageAlloc(io, std.testing.allocator,
@@ -4284,7 +4424,7 @@ test "the in-flight table is bounded" {
 
     for (0..Session.max_inflight_requests) |i| {
         const claimed = try server.implicit_session.claimRequestId(io, .{ .integer = @intCast(1000 + i) });
-        try std.testing.expectEqual(Session.Claim.claimed, claimed);
+        try std.testing.expect(claimed == .claimed);
     }
     defer for (0..Session.max_inflight_requests) |i| {
         server.implicit_session.releaseRequestId(io, .{ .integer = @intCast(1000 + i) });
@@ -4373,6 +4513,170 @@ test "pinning without strict mode still negotiates down" {
     // newer revision.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"protocolVersion\":\"2025-06-18\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"error\"") == null);
+}
+
+/// A tool that runs until it is told to stop, so a test can cancel it while it
+/// is genuinely still running rather than simulating the race.
+const SlowTool = struct {
+    started: std.atomic.Value(bool) = .init(false),
+    observed_cancel: std.atomic.Value(bool) = .init(false),
+    /// Bounds the spin so a broken cancellation path fails the test instead of
+    /// hanging CI forever.
+    max_spins: usize = 2_000_000,
+
+    fn handler(
+        ctx: ?*anyopaque,
+        _: std.Io,
+        allocator: std.mem.Allocator,
+        _: ?std.json.Value,
+        request: *const RequestContext,
+    ) tools_mod.ToolError!tools_mod.ToolResult {
+        const self: *SlowTool = @ptrCast(@alignCast(ctx.?));
+        self.started.store(true, .release);
+
+        var spins: usize = 0;
+        while (!request.isCancelled()) {
+            spins += 1;
+            if (spins > self.max_spins) break;
+            std.atomic.spinLoopHint();
+        }
+        if (request.isCancelled()) self.observed_cancel.store(true, .release);
+
+        return tools_mod.textResult(allocator, "finished") catch return tools_mod.ToolError.OutOfMemory;
+    }
+};
+
+const CancelRace = struct {
+    server: *Server,
+    io: std.Io,
+    tool: *SlowTool,
+    body: ?[]const u8 = null,
+
+    fn callSlowTool(self: *CancelRace) void {
+        const reply = self.server.handleMessageAlloc(self.io, std.testing.allocator,
+            \\{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"slow","arguments":{}}}
+        ) catch return;
+        defer reply.deinit();
+        if (reply.response()) |body| {
+            self.body = std.testing.allocator.dupe(u8, body) catch null;
+        }
+    }
+};
+
+test "a cancellation reaches a tool that is still running" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    var slow: SlowTool = .{};
+    try server.addTool(.{
+        .name = "slow",
+        .description = "spins",
+        .contextual_handler = SlowTool.handler,
+        .user_data = &slow,
+    });
+    try testInitialize(&server, io);
+
+    var race: CancelRace = .{ .server = &server, .io = io, .tool = &slow };
+    const worker = try std.Thread.spawn(.{}, CancelRace.callSlowTool, .{&race});
+
+    // Only cancel once the handler is genuinely inside the call, so this tests
+    // delivery to a running handler rather than a cancellation that arrived
+    // before the work started.
+    while (!slow.started.load(.acquire)) std.atomic.spinLoopHint();
+
+    const ack = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":42,"reason":"user"}}
+    );
+    defer ack.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ack.messages.len);
+
+    worker.join();
+    defer if (race.body) |body| std.testing.allocator.free(body);
+
+    try std.testing.expect(slow.observed_cancel.load(.acquire));
+    const body = race.body orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32800") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Request cancelled") != null);
+}
+
+test "a cancellation for a request that is not in flight is ignored" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try testInitialize(&server, io);
+
+    try std.testing.expect(!server.implicit_session.cancelRequestId(io, .{ .integer = 999 }));
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":999}}
+    );
+    defer reply.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reply.messages.len);
+}
+
+test "a plain tool handler is unaffected by the cancellation plumbing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try server.addTool(.{ .name = "plain", .description = "x", .handler = testNoopTool });
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plain","arguments":{}}}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32800") == null);
+}
+
+test "terminating a session stops every handler running on it" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    const session = &server.implicit_session;
+    const first = (try session.claimRequestId(io, .{ .integer = 1 })).claimed;
+    const second = (try session.claimRequestId(io, .{ .string = "two" })).claimed;
+    defer session.releaseRequestId(io, .{ .integer = 1 });
+    defer session.releaseRequestId(io, .{ .string = "two" });
+
+    try std.testing.expect(!first.isCancelled());
+    session.cancelAllRequests(io);
+    try std.testing.expect(first.isCancelled());
+    try std.testing.expect(second.isCancelled());
+}
+
+test "a cancellation names exactly one request" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    const session = &server.implicit_session;
+    const target = (try session.claimRequestId(io, .{ .integer = 1 })).claimed;
+    const bystander = (try session.claimRequestId(io, .{ .integer = 2 })).claimed;
+    defer session.releaseRequestId(io, .{ .integer = 1 });
+    defer session.releaseRequestId(io, .{ .integer = 2 });
+
+    try std.testing.expect(session.cancelRequestId(io, .{ .integer = 1 }));
+    try std.testing.expect(target.isCancelled());
+    try std.testing.expect(!bystander.isCancelled());
 }
 
 const CustomMethodProbe = struct {
