@@ -176,9 +176,75 @@ const result = client.callTool(io, allocator, "greet", null) catch |err| switch 
 defer result.deinit();
 ```
 
-Messages that are not the awaited response are currently discarded, so
-server-initiated requests (sampling, elicitation, `roots/list`) are not yet
-answered.
+## Handling Server-Initiated Traffic
+
+The server can send the client requests (`sampling/createMessage`,
+`elicitation/create`, `roots/list`) and notifications. They arrive interleaved
+with the replies to the client's own requests, and are dispatched to handlers
+registered by method:
+
+```zig
+fn sample(
+    _: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!std.json.Value {
+    _ = params;
+    var content: std.json.ObjectMap = .empty;
+    try content.put(allocator, "type", .{ .string = "text" });
+    try content.put(allocator, "text", .{ .string = "hello from the model" });
+
+    var result: std.json.ObjectMap = .empty;
+    try result.put(allocator, "role", .{ .string = "assistant" });
+    try result.put(allocator, "content", .{ .object = content });
+    try result.put(allocator, "model", .{ .string = "demo" });
+    return .{ .object = result };
+}
+
+try client.onRequest(allocator, "sampling/createMessage", null, sample);
+```
+
+The returned value becomes the JSON-RPC `result`. It is built with the
+allocator handed to the handler, which is an arena freed as soon as the reply
+is serialized — nothing needs to be freed by the handler, and nothing may be
+retained past it. The `ctx` pointer passed to `onRequest` is handed back
+unchanged, which is how a handler reaches application state.
+
+Notifications are registered the same way with `onNotification`; the handler
+returns `void` because a notification has no reply.
+
+```zig
+try client.onNotification(allocator, "notifications/tools/list_changed", null, onToolsChanged);
+```
+
+Rules the client applies:
+
+- A request with **no registered handler** is answered `-32601 Method not
+  found`. A handler that **fails** is answered `-32603 Internal error`. Either
+  way the server gets an answer rather than waiting forever.
+- A notification with no handler is ignored, and a failing notification handler
+  is swallowed — there is no channel to report it on.
+- A reply belonging to a **different outstanding request** is parked and
+  returned to whoever asks for that id next, so out-of-order replies are not
+  lost. Up to 64 replies are parked; beyond that the oldest excess is dropped.
+
+### Capabilities Require Handlers
+
+`sampling` and `elicitation` are pure callbacks: a client that advertises them
+without a handler tells the server it supports a feature it will then refuse.
+`initialize` therefore fails with `error.MissingSamplingHandler` or
+`error.MissingElicitationHandler` instead of completing a handshake that lies.
+Register the handler before connecting:
+
+```zig
+try client.onRequest(allocator, "sampling/createMessage", null, sample);
+client.enableSampling();
+```
+
+`roots` is exempt: it is answered by a built-in handler backed by the roots
+registered with `addRoot`, so `enableRoots(true)` alone is enough. Registering
+an explicit `roots/list` handler overrides the built-in one.
 
 ## Managing Roots
 
@@ -188,6 +254,9 @@ Roots define the file system areas the client has access to:
 try client.addRoot(allocator, "file:///home/user/project", "Project Root");
 try client.addRoot(allocator, "file:///home/user/data", "Data Directory");
 ```
+
+With the `roots` capability enabled, a server-initiated `roots/list` is
+answered from this list automatically.
 
 ## Complete Example
 

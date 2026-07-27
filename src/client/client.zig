@@ -117,6 +117,31 @@ pub const Response = struct {
     }
 };
 
+/// Answers a server-initiated request. The returned value becomes the JSON-RPC
+/// `result`; it is built with the allocator passed in and is not retained
+/// after the reply is serialized.
+pub const RequestHandler = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!std.json.Value;
+
+/// Observes a server-initiated notification.
+pub const NotificationHandler = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!void;
+
+fn RegistryEntry(comptime Handler: type) type {
+    return struct {
+        ctx: ?*anyopaque,
+        handler: Handler,
+    };
+}
+
 /// Selects one page of a `*/list` response.
 pub const ListOptions = struct {
     /// Cursor from a previous page's `nextCursor`. Null requests the first
@@ -154,6 +179,11 @@ const max_empty_reads = 128;
 /// stops emitting `nextCursor` must not hang the caller.
 const max_list_pages = 1024;
 
+/// Upper bound on replies held for a request other than the one being awaited.
+/// Without a bound a server that answers ids nobody asked for grows this
+/// forever.
+const max_parked_responses = 64;
+
 /// Connection state of the client.
 pub const ClientState = enum {
     disconnected,
@@ -188,6 +218,13 @@ pub const Client = struct {
     last_error: ?ServerError = null,
     roots_list: std.ArrayList(types.Root),
     update_thread: ?std.Thread = null,
+    /// Handlers for server-initiated requests, keyed by method. Keys are owned.
+    request_handlers: std.StringHashMap(RegistryEntry(RequestHandler)),
+    /// Handlers for server-initiated notifications, keyed by method.
+    notification_handlers: std.StringHashMap(RegistryEntry(NotificationHandler)),
+    /// Responses that arrived while a different request was being awaited.
+    /// Raw JSON, owned; drained by a later `awaitResponse`.
+    parked_responses: std.ArrayList([]const u8) = .empty,
 
     const Self = @This();
 
@@ -203,6 +240,8 @@ pub const Client = struct {
             .config = config,
             .pending_requests = .init(allocator),
             .roots_list = .empty,
+            .request_handlers = .init(allocator),
+            .notification_handlers = .init(allocator),
             .update_thread = if (config.check_for_updates) report.checkForUpdates(io, allocator) else null,
         };
     }
@@ -211,6 +250,14 @@ pub const Client = struct {
     pub fn deinit(self: *Self, io: std.Io, allocator: std.mem.Allocator) void {
         self.pending_requests.deinit();
         self.roots_list.deinit(allocator);
+        var request_keys = self.request_handlers.keyIterator();
+        while (request_keys.next()) |k| allocator.free(k.*);
+        self.request_handlers.deinit();
+        var notification_keys = self.notification_handlers.keyIterator();
+        while (notification_keys.next()) |k| allocator.free(k.*);
+        self.notification_handlers.deinit();
+        for (self.parked_responses.items) |raw| allocator.free(raw);
+        self.parked_responses.deinit(allocator);
         if (self.authorization_token) |token| {
             allocator.free(token);
         }
@@ -400,6 +447,8 @@ pub const Client = struct {
 
     /// Sends the initialize request to begin the MCP handshake.
     fn initialize(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
+        try self.validateCapabilityHandlers();
+
         // The params are a throwaway tree. `ObjectMap.deinit` is not
         // recursive, so freeing only the root leaked every nested map.
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -544,12 +593,67 @@ pub const Client = struct {
         return response;
     }
 
+    /// Registers a handler for a server-initiated request.
+    ///
+    /// Replacing an existing handler for the same method is allowed. Without a
+    /// handler the client answers `-32601 Method not found`, which is at least
+    /// a correct answer; before this registry existed the request was dropped
+    /// and the server waited forever.
+    pub fn onRequest(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        ctx: ?*anyopaque,
+        handler: RequestHandler,
+    ) !void {
+        try registerHandler(RequestHandler, &self.request_handlers, allocator, method, ctx, handler);
+    }
+
+    /// Registers a handler for a server-initiated notification.
+    pub fn onNotification(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        ctx: ?*anyopaque,
+        handler: NotificationHandler,
+    ) !void {
+        try registerHandler(NotificationHandler, &self.notification_handlers, allocator, method, ctx, handler);
+    }
+
+    fn registerHandler(
+        comptime Handler: type,
+        map: *std.StringHashMap(RegistryEntry(Handler)),
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        ctx: ?*anyopaque,
+        handler: Handler,
+    ) !void {
+        // The caller's `method` may be a temporary, and the map outlives it.
+        const gop = try map.getOrPut(method);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = allocator.dupe(u8, method) catch |err| {
+                _ = map.remove(method);
+                return err;
+            };
+        }
+        gop.value_ptr.* = .{ .ctx = ctx, .handler = handler };
+    }
+
+    /// Whether a handler is registered for `method`.
+    pub fn hasRequestHandler(self: *const Self, method: []const u8) bool {
+        return self.request_handlers.contains(method);
+    }
+
     /// Reads from the transport until the response with `id` arrives.
     ///
-    /// Messages that are not that response are discarded. Server-initiated
-    /// requests (sampling, elicitation, `roots/list`) are therefore not
-    /// answered yet; they need a handler registry.
+    /// Anything else that arrives on the way is handled rather than dropped:
+    /// server-initiated requests are dispatched to `request_handlers` and
+    /// answered, notifications are dispatched to `notification_handlers`, and
+    /// a reply belonging to a different outstanding request is parked for
+    /// whoever is waiting on it.
     fn awaitResponse(self: *Self, io: std.Io, allocator: std.mem.Allocator, id: i64) !Response {
+        if (try self.takeParkedResponse(allocator, id)) |response| return response;
+
         const t = self.transport orelse return error.NotConnected;
 
         var empty_reads: usize = 0;
@@ -564,7 +668,8 @@ pub const Client = struct {
                 if (empty_reads > max_empty_reads) return error.NoResponse;
                 continue;
             };
-            defer allocator.free(raw);
+            var free_raw = true;
+            defer if (free_raw) allocator.free(raw);
             empty_reads = 0;
 
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{
@@ -579,14 +684,36 @@ pub const Client = struct {
                 else => return error.InvalidResponse,
             };
 
-            // Not the reply we are waiting for: a notification, or a response
-            // to some other request.
-            const id_value = obj.get("id") orelse continue;
-            const response_id = switch (id_value) {
+            const id_value = obj.get("id");
+
+            if (obj.get("method")) |method_value| {
+                const method = switch (method_value) {
+                    .string => |m| m,
+                    else => continue,
+                };
+                const params = obj.get("params");
+                if (id_value) |request_id| {
+                    try self.dispatchServerRequest(io, allocator, method, request_id, params);
+                } else {
+                    try self.dispatchNotification(io, allocator, method, params);
+                }
+                continue;
+            }
+
+            const response_id = switch (id_value orelse continue) {
                 .integer => |i| i,
                 else => continue,
             };
-            if (response_id != id) continue;
+
+            if (response_id != id) {
+                // Another request's reply. Keep it: discarding it is what made
+                // more than one outstanding request impossible.
+                if (self.parked_responses.items.len < max_parked_responses) {
+                    try self.parked_responses.append(allocator, raw);
+                    free_raw = false;
+                }
+                continue;
+            }
 
             if (obj.get("error")) |err_value| {
                 try self.recordServerError(allocator, err_value);
@@ -597,6 +724,158 @@ pub const Client = struct {
             keep = true;
             return .{ .parsed = parsed, .result = result };
         }
+    }
+
+    /// Returns a previously parked reply for `id`, if one arrived while
+    /// another request was being awaited.
+    fn takeParkedResponse(self: *Self, allocator: std.mem.Allocator, id: i64) !?Response {
+        for (self.parked_responses.items, 0..) |raw, i| {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{
+                .ignore_unknown_fields = true,
+                .allocate = .alloc_always,
+            }) catch continue;
+            var keep = false;
+            defer if (!keep) parsed.deinit();
+
+            const obj = switch (parsed.value) {
+                .object => |o| o,
+                else => continue,
+            };
+            const response_id = switch (obj.get("id") orelse .null) {
+                .integer => |v| v,
+                else => continue,
+            };
+            if (response_id != id) continue;
+
+            allocator.free(self.parked_responses.orderedRemove(i));
+
+            if (obj.get("error")) |err_value| {
+                try self.recordServerError(allocator, err_value);
+                return error.ServerError;
+            }
+            const result = obj.get("result") orelse return error.InvalidResponse;
+            keep = true;
+            return .{ .parsed = parsed, .result = result };
+        }
+        return null;
+    }
+
+    /// Runs the registered handler for a server-initiated request and replies.
+    fn dispatchServerRequest(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        request_id: std.json.Value,
+        params: ?std.json.Value,
+    ) !void {
+        const id: types.RequestId = switch (request_id) {
+            .integer => |i| .{ .integer = i },
+            .string => |str| .{ .string = str },
+            else => return,
+        };
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const entry = self.request_handlers.get(method) orelse blk: {
+            // `roots/list` is answerable from state the client already holds,
+            // so advertising the capability is enough to service it.
+            if (self.capabilities.roots != null and std.mem.eql(u8, method, "roots/list")) {
+                const result = self.buildRootsResult(arena.allocator()) catch {
+                    const response = jsonrpc.createErrorResponse(
+                        id,
+                        jsonrpc.ErrorCode.INTERNAL_ERROR,
+                        "Handler failed",
+                        null,
+                    );
+                    return self.sendMessage(io, allocator, .{ .error_response = response });
+                };
+                const response = jsonrpc.createResponse(id, result);
+                return self.sendMessage(io, allocator, .{ .response = response });
+            }
+            break :blk null;
+        } orelse {
+            const response = jsonrpc.createErrorResponse(
+                id,
+                jsonrpc.ErrorCode.METHOD_NOT_FOUND,
+                "Method not found",
+                null,
+            );
+            return self.sendMessage(io, allocator, .{ .error_response = response });
+        };
+
+        const result = entry.handler(entry.ctx, io, arena.allocator(), params) catch {
+            // A failing handler is the client's problem, not a reason to leave
+            // the server blocked.
+            const response = jsonrpc.createErrorResponse(
+                id,
+                jsonrpc.ErrorCode.INTERNAL_ERROR,
+                "Handler failed",
+                null,
+            );
+            return self.sendMessage(io, allocator, .{ .error_response = response });
+        };
+
+        const response = jsonrpc.createResponse(id, result);
+        try self.sendMessage(io, allocator, .{ .response = response });
+    }
+
+    /// Serializes `roots_list` into a `roots/list` result.
+    fn buildRootsResult(self: *Self, allocator: std.mem.Allocator) !std.json.Value {
+        var roots: std.json.Array = .init(allocator);
+        for (self.roots_list.items) |root| {
+            var entry: std.json.ObjectMap = .empty;
+            try entry.put(allocator, "uri", .{ .string = root.uri });
+            if (root.name) |name| try entry.put(allocator, "name", .{ .string = name });
+            try roots.append(.{ .object = entry });
+        }
+        var result: std.json.ObjectMap = .empty;
+        try result.put(allocator, "roots", .{ .array = roots });
+        return .{ .object = result };
+    }
+
+    /// Refuses to advertise a capability the client cannot service.
+    ///
+    /// `sampling` and `elicitation` are pure callbacks: without a handler the
+    /// server is told the client supports them and then gets `-32601` for
+    /// every request. Failing the handshake is the honest answer. `roots` is
+    /// exempt because it has a built-in handler.
+    fn validateCapabilityHandlers(self: *const Self) !void {
+        if (self.capabilities.sampling != null and
+            !self.request_handlers.contains("sampling/createMessage"))
+        {
+            return error.MissingSamplingHandler;
+        }
+        if (self.capabilities.elicitation != null and
+            !self.request_handlers.contains("elicitation/create"))
+        {
+            return error.MissingElicitationHandler;
+        }
+    }
+
+    fn dispatchNotification(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        params: ?std.json.Value,
+    ) !void {
+        const entry = self.notification_handlers.get(method) orelse return;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        // A notification has no reply, so a failing handler can only be
+        // swallowed. Silence beats tearing down the connection.
+        entry.handler(entry.ctx, io, arena.allocator(), params) catch {};
+    }
+
+    fn sendMessage(self: *Self, io: std.Io, allocator: std.mem.Allocator, message: jsonrpc.Message) !void {
+        const t = self.transport orelse return error.NotConnected;
+        const json = try jsonrpc.serializeMessage(allocator, message);
+        defer allocator.free(json);
+        try t.send(io, allocator, json);
     }
 
     /// Stores the code and message from a JSON-RPC error response so the
@@ -1216,4 +1495,252 @@ test "the page walk refuses a cursor that never advances" {
     client.transport = scripted.transport();
 
     try std.testing.expectError(error.CursorNotAdvancing, client.listAllTools(io, allocator));
+}
+
+/// A `ScriptedTransport` that also keeps every frame the client sent, so the
+/// replies the client generates for server-initiated traffic can be asserted.
+const RecordingTransport = struct {
+    replies: []const []const u8,
+    next: usize = 0,
+    sent: std.ArrayList([]const u8) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *RecordingTransport) void {
+        for (self.sent.items) |frame| self.allocator.free(frame);
+        self.sent.deinit(self.allocator);
+    }
+
+    fn send(self: *RecordingTransport, _: std.Io, _: std.mem.Allocator, data: []const u8) transport_mod.Transport.SendError!void {
+        const copy = self.allocator.dupe(u8, data) catch
+            return transport_mod.Transport.SendError.OutOfMemory;
+        self.sent.append(self.allocator, copy) catch {
+            self.allocator.free(copy);
+            return transport_mod.Transport.SendError.OutOfMemory;
+        };
+    }
+
+    fn receive(self: *RecordingTransport, _: std.Io, allocator: std.mem.Allocator) transport_mod.Transport.ReceiveError!?[]const u8 {
+        if (self.next >= self.replies.len) return null;
+        defer self.next += 1;
+        return allocator.dupe(u8, self.replies[self.next]) catch
+            return transport_mod.Transport.ReceiveError.OutOfMemory;
+    }
+
+    fn close(_: *RecordingTransport) void {}
+
+    fn deinitFn(_: *anyopaque, _: std.mem.Allocator) void {}
+
+    const vtable: transport_mod.Transport.VTable = .{
+        .send = @ptrCast(&send),
+        .receive = @ptrCast(&receive),
+        .close = @ptrCast(&close),
+        .deinit = deinitFn,
+    };
+
+    fn transport(self: *RecordingTransport) transport_mod.Transport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// The frame the client sent for a server request with `id`.
+    fn replyTo(self: *const RecordingTransport, id: []const u8) ?[]const u8 {
+        const needle = std.fmt.allocPrint(self.allocator, "\"id\":{s}", .{id}) catch return null;
+        defer self.allocator.free(needle);
+        for (self.sent.items) |frame| {
+            if (std.mem.indexOf(u8, frame, needle) != null and
+                std.mem.indexOf(u8, frame, "\"method\"") == null) return frame;
+        }
+        return null;
+    }
+};
+
+test "a server-initiated roots/list is answered from the registered roots" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var recording: RecordingTransport = .{ .allocator = allocator, .replies = &.{
+        \\{"jsonrpc":"2.0","id":77,"method":"roots/list"}
+        ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+        ,
+    } };
+    defer recording.deinit();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+    client.transport = recording.transport();
+    client.enableRoots(false);
+    try client.addRoot(allocator, "file:///srv", "Srv");
+
+    // The awaited response must still resolve past the interleaved request.
+    const tools = try client.listTools(io, allocator, .{});
+    defer tools.deinit();
+
+    const reply = recording.replyTo("77") orelse return error.NoReplySent;
+    try std.testing.expect(std.mem.indexOf(u8, reply, "file:///srv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"name\":\"Srv\"") != null);
+}
+
+test "a server request with no handler is answered -32601 instead of dropped" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var recording: RecordingTransport = .{ .allocator = allocator, .replies = &.{
+        \\{"jsonrpc":"2.0","id":9,"method":"sampling/createMessage","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+        ,
+    } };
+    defer recording.deinit();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+    client.transport = recording.transport();
+
+    const tools = try client.listTools(io, allocator, .{});
+    defer tools.deinit();
+
+    const reply = recording.replyTo("9") orelse return error.NoReplySent;
+    try std.testing.expect(std.mem.indexOf(u8, reply, "-32601") != null);
+}
+
+var test_notification_hits: usize = 0;
+
+fn countNotification(
+    _: ?*anyopaque,
+    _: std.Io,
+    _: std.mem.Allocator,
+    _: ?std.json.Value,
+) anyerror!void {
+    test_notification_hits += 1;
+}
+
+test "a notification arriving mid-request fires its handler and does not eat the response" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var recording: RecordingTransport = .{ .allocator = allocator, .replies = &.{
+        \\{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}
+        ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}
+        ,
+    } };
+    defer recording.deinit();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+    client.transport = recording.transport();
+
+    test_notification_hits = 0;
+    try client.onNotification(allocator, "notifications/tools/list_changed", null, countNotification);
+
+    const tools = try client.listTools(io, allocator, .{});
+    defer tools.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), test_notification_hits);
+    try std.testing.expectEqual(@as(usize, 1), tools.get("tools").?.array.items.len);
+    // A notification carries no id, so it must never be answered.
+    try std.testing.expectEqual(@as(usize, 1), recording.sent.items.len);
+}
+
+test "a reply for another request is parked, not discarded" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The reply to request 2 arrives before the reply to request 1.
+    var recording: RecordingTransport = .{ .allocator = allocator, .replies = &.{
+        \\{"jsonrpc":"2.0","id":2,"result":{"prompts":[{"name":"later"}]}}
+        ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"first"}]}}
+        ,
+    } };
+    defer recording.deinit();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+    client.transport = recording.transport();
+
+    const tools = try client.listTools(io, allocator, .{});
+    defer tools.deinit();
+    try std.testing.expectEqualStrings("first", tools.get("tools").?.array.items[0].object.get("name").?.string);
+
+    // The transport is exhausted, so this can only succeed from the park.
+    const prompts = try client.listPrompts(io, allocator, .{});
+    defer prompts.deinit();
+    try std.testing.expectEqualStrings("later", prompts.get("prompts").?.array.items[0].object.get("name").?.string);
+}
+
+fn stubSampling(
+    _: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    _: ?std.json.Value,
+) anyerror!std.json.Value {
+    var result: std.json.ObjectMap = .empty;
+    try result.put(allocator, "role", .{ .string = "assistant" });
+    return .{ .object = result };
+}
+
+test "the handshake refuses to advertise sampling with no handler" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var recording: RecordingTransport = .{ .allocator = allocator, .replies = &.{} };
+    defer recording.deinit();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+    client.transport = recording.transport();
+    client.enableSampling();
+
+    try std.testing.expectError(error.MissingSamplingHandler, client.initialize(io, allocator));
+
+    // Registering the handler makes the same capability legitimate, so the
+    // handshake gets past the check and fails later on the empty transport.
+    try client.onRequest(allocator, "sampling/createMessage", null, stubSampling);
+    try std.testing.expectError(error.NoResponse, client.initialize(io, allocator));
+}
+
+test "a registered handler takes precedence over the built-in roots/list" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var recording: RecordingTransport = .{ .allocator = allocator, .replies = &.{
+        \\{"jsonrpc":"2.0","id":5,"method":"roots/list"}
+        ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+        ,
+    } };
+    defer recording.deinit();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+    client.transport = recording.transport();
+    client.enableRoots(false);
+    try client.addRoot(allocator, "file:///builtin", "Builtin");
+    try client.onRequest(allocator, "roots/list", null, stubSampling);
+
+    const tools = try client.listTools(io, allocator, .{});
+    defer tools.deinit();
+
+    const reply = recording.replyTo("5") orelse return error.NoReplySent;
+    try std.testing.expect(std.mem.indexOf(u8, reply, "file:///builtin") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "assistant") != null);
 }
