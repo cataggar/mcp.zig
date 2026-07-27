@@ -91,6 +91,10 @@ pub const sampling = @import("client/sampling.zig");
 pub const config = @import("config.zig");
 pub const ServerSpec = config.ServerSpec;
 
+pub const host = @import("host.zig");
+pub const Host = host.Host;
+pub const HostConfig = host.HostConfig;
+
 pub const utils = @import("utils/mod.zig");
 pub const errors = @import("utils/errors.zig");
 pub const logging = @import("utils/logging.zig");

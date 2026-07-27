@@ -396,6 +396,7 @@ gtag('config', '${GA_ID}');`,
           { text: "Prompts", link: "/guide/prompts" },
           { text: "Transport", link: "/guide/transport" },
           { text: "Configuration", link: "/guide/configuration" },
+          { text: "Multiple Servers", link: "/guide/host" },
         ],
       },
       {
