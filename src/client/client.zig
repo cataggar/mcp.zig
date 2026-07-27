@@ -5,6 +5,7 @@
 //! methods for listing and invoking tools, reading resources, and fetching prompts.
 //! Supports task-augmented requests, sampling, elicitation, and roots.
 
+const builtin = @import("builtin");
 const std = @import("std");
 
 const jsonrpc = @import("../protocol/jsonrpc.zig");
@@ -393,7 +394,9 @@ pub const Client = struct {
         stdio.* = .{ .in = child.stdout.?, .out = child.stdin.? };
 
         self.child = child;
+        errdefer self.child = null;
         self.transport = stdio.transport();
+        errdefer self.transport = null;
 
         try self.initialize(io, allocator);
     }
@@ -441,6 +444,10 @@ pub const Client = struct {
             try http.setAuthorizationToken(allocator, token);
         }
         self.transport = http.transport();
+        // The transport is now reachable from `self`, but the `errdefer`s above
+        // still own it. Unpublish it on failure so it is freed by one owner or
+        // the other and never by both.
+        errdefer self.transport = null;
 
         try self.initialize(io, allocator);
     }
@@ -1743,4 +1750,47 @@ test "a registered handler takes precedence over the built-in roots/list" {
     const reply = recording.replyTo("5") orelse return error.NoReplySent;
     try std.testing.expect(std.mem.indexOf(u8, reply, "file:///builtin") == null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "assistant") != null);
+}
+
+test "a failed handshake does not leave a transport for deinit to free twice" {
+    // Ownership of the transport moves onto the client before the handshake
+    // runs, so a connect that fails there used to free it once via the
+    // connect's own errdefer and again via the caller's deinit.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: Client = .init(io, std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer client.deinit(io, std.testing.allocator);
+
+    // Port 1 is reserved and never listening, so `initialize` cannot succeed.
+    // The exact error depends on how the platform reports a refused connect,
+    // which is not what this is about.
+    if (client.connectHttp(io, std.testing.allocator, "http://127.0.0.1:1/")) |_| {
+        return error.ExpectedConnectFailure;
+    } else |_| {}
+    try std.testing.expect(client.transport == null);
+}
+
+test "a stdio server that dies mid-handshake is torn down exactly once" {
+    // Same ownership hazard as the http path: the child and its transport are
+    // both published on `self` before the handshake, while the connect's own
+    // `errdefer`s still hold them.
+    if (builtin.os.tag == .windows) return;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: Client = .init(io, std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer client.deinit(io, std.testing.allocator);
+
+    // Spawns cleanly and then closes its stdout, so `initialize` gets EOF.
+    if (client.connectStdioOptions(io, std.testing.allocator, "/bin/sh", .{
+        .args = &.{ "-c", "exit 0" },
+    })) |_| {
+        return error.ExpectedHandshakeFailure;
+    } else |_| {}
+    try std.testing.expect(client.transport == null);
+    try std.testing.expect(client.child == null);
 }
