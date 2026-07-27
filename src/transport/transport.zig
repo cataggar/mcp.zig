@@ -231,8 +231,28 @@ pub const HttpTransport = struct {
     protocol_version: []const u8 = "2025-11-25",
     is_closed: bool = false,
     pending_responses: std.ArrayList([]const u8) = .empty,
+    /// Caller-supplied headers sent with every request. Owned by the
+    /// transport; see `setExtraHeaders`.
+    extra_headers: []const std.http.Header = &.{},
 
     const Self = @This();
+
+    /// Headers this transport builds itself. A caller supplying one of these
+    /// is a configuration error rather than an override, because changing them
+    /// breaks the protocol rather than customising it.
+    pub const reserved_header_names = [_][]const u8{
+        "content-type",
+        "accept",
+        "mcp-protocol-version",
+        "mcp-session-id",
+    };
+
+    pub const HeaderError = error{
+        InvalidHeaderName,
+        InvalidHeaderValue,
+        ReservedHeader,
+        DuplicateAuthorization,
+    };
 
     /// Initializes a new HTTP transport with the given endpoint URL.
     pub fn init(allocator: std.mem.Allocator, endpoint: []const u8) !Self {
@@ -255,6 +275,83 @@ pub const HttpTransport = struct {
         if (self.authorization_token) |token| {
             allocator.free(token);
         }
+        self.freeExtraHeaders(allocator);
+    }
+
+    fn freeExtraHeaders(self: *Self, allocator: std.mem.Allocator) void {
+        for (self.extra_headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(self.extra_headers);
+        self.extra_headers = &.{};
+    }
+
+    fn isTokenChar(c: u8) bool {
+        return switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9' => true,
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+            else => false,
+        };
+    }
+
+    /// Rejects anything that could inject a second header, or a body, into the
+    /// request head. Config files are a normal source of these values, so this
+    /// is an untrusted-input boundary.
+    fn validateHeader(header: std.http.Header) HeaderError!void {
+        if (header.name.len == 0) return error.InvalidHeaderName;
+        for (header.name) |c| {
+            if (!isTokenChar(c)) return error.InvalidHeaderName;
+        }
+        for (header.value) |c| {
+            if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeaderValue;
+        }
+        for (reserved_header_names) |reserved| {
+            if (std.ascii.eqlIgnoreCase(header.name, reserved)) return error.ReservedHeader;
+        }
+    }
+
+    fn headersContainAuthorization(headers: []const std.http.Header) bool {
+        for (headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization")) return true;
+        }
+        return false;
+    }
+
+    /// Replaces the caller-supplied headers sent with every request.
+    ///
+    /// The transport takes its own copies, so `headers` need not outlive the
+    /// call. Validation is all-or-nothing: on error the previous headers are
+    /// left in place.
+    pub fn setExtraHeaders(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        headers: []const std.http.Header,
+    ) (HeaderError || std.mem.Allocator.Error)!void {
+        for (headers) |h| try validateHeader(h);
+        if (self.authorization_token != null and headersContainAuthorization(headers)) {
+            return error.DuplicateAuthorization;
+        }
+
+        const owned = try allocator.alloc(std.http.Header, headers.len);
+        var filled: usize = 0;
+        errdefer {
+            for (owned[0..filled]) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(owned);
+        }
+        for (headers, 0..) |h, i| {
+            const name = try allocator.dupe(u8, h.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, h.value);
+            owned[i] = .{ .name = name, .value = value };
+            filled = i + 1;
+        }
+
+        self.freeExtraHeaders(allocator);
+        self.extra_headers = owned;
     }
 
     /// Sends a JSON-RPC message via HTTP POST.
@@ -296,6 +393,11 @@ pub const HttpTransport = struct {
                 return Transport.SendError.OutOfMemory;
             };
         }
+
+        // Validated on the way in, so nothing here can inject a second header.
+        extra_headers.appendSlice(allocator, self.extra_headers) catch {
+            return Transport.SendError.OutOfMemory;
+        };
 
         // Do not follow redirects. This request carries a bearer token and a
         // session id, and both are credentials for *this* endpoint. Following a
@@ -392,6 +494,9 @@ pub const HttpTransport = struct {
 
     /// Sets the authorization token for Bearer auth (OAuth 2.1).
     pub fn setAuthorizationToken(self: *Self, allocator: std.mem.Allocator, token: []const u8) !void {
+        // Two Authorization headers on one request is not a resolvable
+        // ambiguity: pick one place to configure the credential.
+        if (headersContainAuthorization(self.extra_headers)) return error.DuplicateAuthorization;
         if (self.authorization_token) |old| {
             allocator.free(old);
         }
@@ -487,7 +592,12 @@ pub fn createTransport(
         .http => {
             const url = options.url orelse return error.MissingUrl;
             const http_transport = try allocator.create(HttpTransport);
+            errdefer allocator.destroy(http_transport);
             http_transport.* = try .init(allocator, url);
+            errdefer http_transport.deinit(allocator);
+            if (options.extra_headers.len > 0) {
+                try http_transport.setExtraHeaders(allocator, options.extra_headers);
+            }
             if (options.authorization_token) |token| {
                 try http_transport.setAuthorizationToken(allocator, token);
             }
@@ -500,6 +610,9 @@ pub fn createTransport(
 pub const TransportOptions = struct {
     url: ?[]const u8 = null,
     authorization_token: ?[]const u8 = null,
+    /// Headers sent with every HTTP request. See
+    /// `HttpTransport.setExtraHeaders` for the validation rules.
+    extra_headers: []const std.http.Header = &.{},
 };
 
 test "StdioTransport initialization" {
@@ -859,4 +972,99 @@ test "stdio send writes to the configured stream, not this process's stdout" {
     const written = try tmp.dir.readFileAlloc(io, "out.jsonl", allocator, .limited(1024));
     defer allocator.free(written);
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\"}\n", written);
+}
+
+test "HttpTransport sends caller-supplied headers" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try bindTestListener(io, 39400, &port);
+    defer listener.deinit(io);
+
+    const replies = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}",
+    };
+    var origin: TestHttpOrigin = .{
+        .listener = &listener,
+        .replies = &replies,
+        .allocator = allocator,
+    };
+    defer origin.deinit();
+
+    const thread = try std.Thread.spawn(.{}, TestHttpOrigin.run, .{&origin});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(endpoint);
+
+    var transport_impl = try HttpTransport.init(allocator, endpoint);
+    defer transport_impl.deinit(allocator);
+    try transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "X-Api-Key", .value = "sekrit" },
+        .{ .name = "X-Tenant", .value = "acme" },
+    });
+
+    try transport_impl.send(io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
+
+    try std.testing.expectEqual(@as(usize, 1), origin.captured_count);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "x-api-key: sekrit") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "x-tenant: acme") != null);
+}
+
+test "HttpTransport rejects headers it builds itself" {
+    const allocator = std.testing.allocator;
+    var transport_impl = try HttpTransport.init(allocator, "http://127.0.0.1:1/");
+    defer transport_impl.deinit(allocator);
+
+    for (HttpTransport.reserved_header_names) |name| {
+        try std.testing.expectError(error.ReservedHeader, transport_impl.setExtraHeaders(allocator, &.{
+            .{ .name = name, .value = "x" },
+        }));
+    }
+    // Case must not be an escape hatch.
+    try std.testing.expectError(error.ReservedHeader, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "Mcp-Session-Id", .value = "x" },
+    }));
+}
+
+test "HttpTransport rejects header values and names that would inject a header" {
+    const allocator = std.testing.allocator;
+    var transport_impl = try HttpTransport.init(allocator, "http://127.0.0.1:1/");
+    defer transport_impl.deinit(allocator);
+
+    try std.testing.expectError(error.InvalidHeaderValue, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "X-Evil", .value = "a\r\nX-Injected: yes" },
+    }));
+    try std.testing.expectError(error.InvalidHeaderValue, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "X-Evil", .value = "a\nb" },
+    }));
+    try std.testing.expectError(error.InvalidHeaderName, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "X-Evil: injected", .value = "a" },
+    }));
+    try std.testing.expectError(error.InvalidHeaderName, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "", .value = "a" },
+    }));
+
+    // A rejected batch must leave the previous configuration untouched.
+    try std.testing.expectEqual(@as(usize, 0), transport_impl.extra_headers.len);
+}
+
+test "HttpTransport refuses two sources of Authorization" {
+    const allocator = std.testing.allocator;
+
+    var a = try HttpTransport.init(allocator, "http://127.0.0.1:1/");
+    defer a.deinit(allocator);
+    try a.setAuthorizationToken(allocator, "tok");
+    try std.testing.expectError(error.DuplicateAuthorization, a.setExtraHeaders(allocator, &.{
+        .{ .name = "Authorization", .value = "Basic abc" },
+    }));
+
+    var b = try HttpTransport.init(allocator, "http://127.0.0.1:1/");
+    defer b.deinit(allocator);
+    try b.setExtraHeaders(allocator, &.{.{ .name = "authorization", .value = "Basic abc" }});
+    try std.testing.expectError(error.DuplicateAuthorization, b.setAuthorizationToken(allocator, "tok"));
 }

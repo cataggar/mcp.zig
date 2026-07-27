@@ -334,11 +334,35 @@ pub const Client = struct {
 
     /// Connects to a server via HTTP at the specified URL.
     pub fn connectHttp(self: *Self, io: std.Io, allocator: std.mem.Allocator, url: []const u8) !void {
+        return self.connectHttpOptions(io, allocator, url, .{});
+    }
+
+    /// Options for `connectHttpOptions`.
+    pub const HttpOptions = struct {
+        /// Headers sent with every request, for auth schemes and routing
+        /// headers the transport does not model itself. See
+        /// `HttpTransport.setExtraHeaders` for the validation rules.
+        extra_headers: []const std.http.Header = &.{},
+    };
+
+    /// Connects to a server via HTTP, with caller-supplied request headers.
+    pub fn connectHttpOptions(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        options: HttpOptions,
+    ) !void {
         self.state = .connecting;
         errdefer self.state = .error_state;
 
         const http = try allocator.create(transport_mod.HttpTransport);
+        errdefer allocator.destroy(http);
         http.* = try transport_mod.HttpTransport.init(allocator, url);
+        errdefer http.deinit(allocator);
+        if (options.extra_headers.len > 0) {
+            try http.setExtraHeaders(allocator, options.extra_headers);
+        }
         if (self.authorization_token) |token| {
             try http.setAuthorizationToken(allocator, token);
         }
