@@ -16,24 +16,28 @@ const resources_mod = @import("resources.zig");
 const tools_mod = @import("tools.zig");
 
 const HttpRequestTransport = struct {
+    /// Owns `response_message`. Must outlive the whole request, because the
+    /// `allocator` handed to `send` is a per-message arena that is destroyed
+    /// before the response is written to the socket.
+    owner_allocator: std.mem.Allocator,
     response_message: ?[]const u8 = null,
     is_closed: bool = false,
 
     const Self = @This();
 
-    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Self) void {
         if (self.response_message) |msg| {
-            allocator.free(msg);
+            self.owner_allocator.free(msg);
             self.response_message = null;
         }
     }
 
-    pub fn send(self: *Self, _: std.Io, allocator: std.mem.Allocator, message: []const u8) transport_mod.Transport.SendError!void {
+    pub fn send(self: *Self, _: std.Io, _: std.mem.Allocator, message: []const u8) transport_mod.Transport.SendError!void {
         if (self.is_closed) return transport_mod.Transport.SendError.ConnectionClosed;
 
-        const owned = allocator.dupe(u8, message) catch return transport_mod.Transport.SendError.OutOfMemory;
+        const owned = self.owner_allocator.dupe(u8, message) catch return transport_mod.Transport.SendError.OutOfMemory;
         if (self.response_message) |old| {
-            allocator.free(old);
+            self.owner_allocator.free(old);
         }
         self.response_message = owned;
     }
@@ -358,8 +362,8 @@ pub const Server = struct {
         };
         defer allocator.free(body_items);
 
-        var request_transport: HttpRequestTransport = .{};
-        defer request_transport.deinit(allocator);
+        var request_transport: HttpRequestTransport = .{ .owner_allocator = allocator };
+        defer request_transport.deinit();
 
         const previous_transport = self.transport;
         self.transport = request_transport.transport();
@@ -1646,4 +1650,68 @@ test "Server enable capabilities" {
     try std.testing.expect(server.capabilities.logging != null);
     try std.testing.expect(server.capabilities.completions != null);
     try std.testing.expect(server.capabilities.tasks != null);
+}
+
+test "HttpRequestTransport response outlives the per-message arena" {
+    // Regression test for the use-after-free / invalid free in
+    // handleHttpJsonRpcRequest: handleMessage wraps each message in an
+    // ArenaAllocator and passes the arena allocator down to Transport.send.
+    // If the transport dupes the response with that arena allocator, the
+    // buffer is freed by arena.deinit() before the caller reads it and is
+    // then freed a second time by the transport's own deinit.
+    //
+    // Two sequential messages are required: with the bug present the first
+    // one still appears to succeed, because the arena's backing pages are
+    // still mapped and nothing has reused them yet.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{
+        .name = "test-server",
+        .version = "1.0.0",
+    });
+    defer server.deinit();
+
+    for (0..2) |i| {
+        var request_transport: HttpRequestTransport = .{ .owner_allocator = std.testing.allocator };
+        defer request_transport.deinit();
+
+        const previous_transport = server.transport;
+        server.transport = request_transport.transport();
+        defer server.transport = previous_transport;
+
+        var buf: [128]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"ping\"}}", .{i});
+
+        try server.handleMessage(io, std.testing.allocator, body);
+
+        // Read the response after handleMessage has returned, i.e. after its
+        // arena has been destroyed. This is the use-after-free.
+        const response = request_transport.response_message orelse
+            return error.NoResponseProduced;
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"jsonrpc\":\"2.0\"") != null);
+    }
+}
+
+test "HttpRequestTransport replaces an earlier response without leaking" {
+    // send() may be called more than once for a single message; the previous
+    // buffer must be freed with the same allocator that allocated it.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var request_transport: HttpRequestTransport = .{ .owner_allocator = std.testing.allocator };
+    defer request_transport.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const aa = arena.allocator();
+
+    try request_transport.send(io, aa, "first");
+    try request_transport.send(io, aa, "second");
+
+    // Destroying the scratch arena must not invalidate the stored response.
+    arena.deinit();
+
+    try std.testing.expectEqualStrings("second", request_transport.response_message.?);
 }
