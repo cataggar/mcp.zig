@@ -21,26 +21,33 @@ const HttpRequestTransport = struct {
     /// `allocator` handed to `send` is a per-message arena that is destroyed
     /// before the response is written to the socket.
     owner_allocator: std.mem.Allocator,
-    response_message: ?[]const u8 = null,
+    /// Every message the handler produced, in order.
+    ///
+    /// A handler may emit progress notifications before its result, so keeping
+    /// only the last one silently dropped everything but the final message.
+    messages: std.ArrayList([]const u8) = .empty,
     is_closed: bool = false,
 
     const Self = @This();
 
     pub fn deinit(self: *Self) void {
-        if (self.response_message) |msg| {
-            self.owner_allocator.free(msg);
-            self.response_message = null;
-        }
+        for (self.messages.items) |msg| self.owner_allocator.free(msg);
+        self.messages.deinit(self.owner_allocator);
+        self.messages = .empty;
+    }
+
+    /// The final message, which for a request is its response.
+    pub fn responseMessage(self: *const Self) ?[]const u8 {
+        if (self.messages.items.len == 0) return null;
+        return self.messages.items[self.messages.items.len - 1];
     }
 
     pub fn send(self: *Self, _: std.Io, _: std.mem.Allocator, message: []const u8) transport_mod.Transport.SendError!void {
         if (self.is_closed) return transport_mod.Transport.SendError.ConnectionClosed;
 
         const owned = self.owner_allocator.dupe(u8, message) catch return transport_mod.Transport.SendError.OutOfMemory;
-        if (self.response_message) |old| {
-            self.owner_allocator.free(old);
-        }
-        self.response_message = owned;
+        errdefer self.owner_allocator.free(owned);
+        self.messages.append(self.owner_allocator, owned) catch return transport_mod.Transport.SendError.OutOfMemory;
     }
 
     pub fn receive(self: *Self, _: std.Io, _: std.mem.Allocator) transport_mod.Transport.ReceiveError!?[]const u8 {
@@ -150,6 +157,14 @@ pub const Session = struct {
     /// Set when the session has been terminated but still has live references.
     /// The last reference to be released performs the teardown.
     closing: bool = false,
+    /// Monotonic SSE event id for this session. Ids are session-global so a
+    /// client can resume with `Last-Event-ID` regardless of which stream an
+    /// event was originally delivered on.
+    event_seq: u64 = 0,
+    /// Recent events, retained so a reconnecting client can be caught up.
+    /// Bounded by `max_replay_events`; older events are dropped, which is
+    /// visible to the client as a gap it can recover from by re-initializing.
+    replay: std.ArrayList(Event) = .empty,
     /// Set alongside `closing`. Long-running handlers should poll
     /// `isCancelled` and abandon work whose result can no longer be delivered.
     cancel_requested: bool = false,
@@ -180,6 +195,34 @@ pub const Session = struct {
         return self.cancel_requested;
     }
 
+    /// An SSE event queued for delivery on this session's streams.
+    pub const Event = struct {
+        id: u64,
+        data: []const u8,
+    };
+
+    /// Number of events retained for `Last-Event-ID` resumption.
+    pub const max_replay_events = 256;
+
+    /// Record a message as an SSE event and return its id.
+    pub fn pushEvent(self: *Session, allocator: std.mem.Allocator, data: []const u8) !u64 {
+        const owned = try allocator.dupe(u8, data);
+        errdefer allocator.free(owned);
+        self.event_seq += 1;
+        try self.replay.append(allocator, .{ .id = self.event_seq, .data = owned });
+        if (self.replay.items.len > max_replay_events) {
+            const dropped = self.replay.orderedRemove(0);
+            allocator.free(dropped.data);
+        }
+        return self.event_seq;
+    }
+
+    fn deinitReplay(self: *Session, allocator: std.mem.Allocator) void {
+        for (self.replay.items) |event| allocator.free(event.data);
+        self.replay.deinit(allocator);
+        self.replay = .empty;
+    }
+
     pub fn deinit(self: *Session, allocator: std.mem.Allocator) void {
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
@@ -192,6 +235,7 @@ pub const Session = struct {
         }
         self.tasks.deinit();
         self.pending_requests.deinit();
+        self.deinitReplay(allocator);
         if (self.client_info) |ci| {
             allocator.free(ci.name);
             allocator.free(ci.version);
@@ -363,6 +407,32 @@ pub const Server = struct {
         session.id = key;
         session.last_seen_s = nowSeconds(io);
         return .{ .session = session, .plaintext_id = plaintext };
+    }
+
+    /// Queue a message on every live session's event stream.
+    fn broadcastEvent(self: *Self, io: std.Io, json: []const u8) void {
+        self.sessions_mutex.lock(io) catch return;
+        defer self.sessions_mutex.unlock(io);
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            if (session.closing) continue;
+            _ = session.pushEvent(self.allocator, json) catch continue;
+        }
+    }
+
+    /// Append one `id:`/`data:` SSE frame.
+    ///
+    /// A JSON-RPC message is a single line, but split on newlines anyway: an
+    /// embedded newline would otherwise terminate the frame early and let a
+    /// message forge the ones after it.
+    fn appendSseEvent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), id: u64, data: []const u8) !void {
+        if (id != 0) try out.print(allocator, "id: {d}\n", .{id});
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            try out.print(allocator, "data: {s}\n", .{line});
+        }
+        try out.appendSlice(allocator, "\n");
     }
 
     /// Whether a client-presented `MCP-Protocol-Version` is one we speak.
@@ -855,7 +925,7 @@ pub const Server = struct {
         };
 
         // POST carries JSON-RPC; DELETE terminates a session.
-        if (request.head.method != .POST and request.head.method != .DELETE) {
+        if (request.head.method != .POST and request.head.method != .DELETE and request.head.method != .GET) {
             try request.respond("Method Not Allowed", .{
                 .status = .method_not_allowed,
                 .extra_headers = &.{
@@ -908,6 +978,11 @@ pub const Server = struct {
             }
         }
 
+        if (request.head.method == .GET) {
+            try self.handleHttpEventStream(io, allocator, &request, config);
+            return;
+        }
+
         if (request.head.method == .DELETE) {
             try self.handleHttpSessionDelete(io, &request);
             return;
@@ -915,6 +990,122 @@ pub const Server = struct {
 
         try self.handleHttpJsonRpcRequest(io, allocator, &request);
     }
+
+    /// Handle `GET` — the server-to-client event stream.
+    ///
+    /// This is the channel the spec reserves for server-initiated messages.
+    /// Without it, notifications and progress can only ride along with a
+    /// response the client happened to ask for.
+    fn handleHttpEventStream(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        request: *http.Server.Request,
+        config: HttpRunConfig,
+    ) !void {
+        var session_id: ?[]const u8 = null;
+        var last_event_id: u64 = 0;
+        var accepts_sse = false;
+        var header_it = http.HeaderIterator.init(request.head_buffer);
+        while (header_it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) {
+                session_id = header.value;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "last-event-id")) {
+                last_event_id = std.fmt.parseInt(u64, std.mem.trim(u8, header.value, " \t"), 10) catch 0;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "accept")) {
+                if (std.mem.indexOf(u8, header.value, "text/event-stream") != null) accepts_sse = true;
+            }
+        }
+
+        if (!accepts_sse) {
+            try request.respond("GET requires Accept: text/event-stream", .{
+                .status = .not_acceptable,
+                .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+            });
+            return;
+        }
+
+        const sid = session_id orelse {
+            // A stream is per-session by definition; there is nothing to
+            // deliver on a stream that is not attached to one.
+            try request.respond("Mcp-Session-Id required", .{
+                .status = .bad_request,
+                .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+            });
+            return;
+        };
+
+        const session = self.acquireSession(io, sid) orelse {
+            if (self.wasTerminated(io, sid)) {
+                try request.respond("MCP session terminated; re-initialize", .{
+                    .status = .gone,
+                    .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+                });
+                return;
+            }
+            try request.respond("Unknown or expired MCP session", .{
+                .status = .not_found,
+                .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+            });
+            return;
+        };
+        defer self.releaseSession(io, session);
+
+        var send_buffer: [4096]u8 = undefined;
+        var body = try request.respondStreaming(&send_buffer, .{
+            .respond_options = .{
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/event-stream" },
+                    .{ .name = "Cache-Control", .value = "no-cache" },
+                },
+            },
+        });
+
+        // `Last-Event-ID` resumption: everything newer than what the client
+        // already saw, from the bounded replay buffer.
+        var delivered = last_event_id;
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(allocator);
+
+        var idle_ms: i64 = 0;
+        while (self.lifecycle == .running and !session.closing) {
+            frame.clearRetainingCapacity();
+
+            self.sessions_mutex.lock(io) catch break;
+            for (session.replay.items) |event| {
+                if (event.id <= delivered) continue;
+                appendSseEvent(allocator, &frame, event.id, event.data) catch break;
+                delivered = event.id;
+            }
+            self.sessions_mutex.unlock(io);
+
+            if (frame.items.len > 0) {
+                idle_ms = 0;
+                body.writer.writeAll(frame.items) catch break;
+                body.flush() catch break;
+                continue;
+            }
+
+            // A comment is a no-op to the client but keeps proxies and NAT
+            // tables from reaping an idle stream.
+            if (idle_ms >= stream_keepalive_ms) {
+                idle_ms = 0;
+                body.writer.writeAll(": keepalive\n\n") catch break;
+                body.flush() catch break;
+            }
+
+            io.sleep(.fromMilliseconds(stream_poll_ms), .awake) catch break;
+            idle_ms += stream_poll_ms;
+            _ = config;
+        }
+
+        body.end() catch {};
+    }
+
+    /// How often the event stream checks for new events.
+    const stream_poll_ms: i64 = 25;
+    /// How long an event stream may be silent before a keepalive comment.
+    const stream_keepalive_ms: i64 = 15_000;
 
     /// Handle `DELETE` — explicit session termination.
     ///
@@ -1247,19 +1438,26 @@ pub const Server = struct {
             header_len = 3;
         }
 
-        if (request_transport.response_message) |response_json| {
+        if (request_transport.messages.items.len > 0) {
             if (wants_sse) {
-                const sse_body = try std.fmt.allocPrint(allocator, "data: {s}\n\n", .{response_json});
-                defer allocator.free(sse_body);
+                // Every message the handler emitted becomes its own event, so
+                // progress notifications sent before the result survive. Each
+                // carries an id, which is what makes `Last-Event-ID` work.
+                var body: std.ArrayList(u8) = .empty;
+                defer body.deinit(allocator);
+                for (request_transport.messages.items) |message| {
+                    const id = session.pushEvent(self.allocator, message) catch 0;
+                    try appendSseEvent(allocator, &body, id, message);
+                }
                 header_buf[0] = .{ .name = "Content-Type", .value = "text/event-stream" };
-                try request.respond(sse_body, .{
+                try request.respond(body.items, .{
                     .status = .ok,
                     .extra_headers = header_buf[0..header_len],
                 });
                 return;
             }
 
-            try request.respond(response_json, .{
+            try request.respond(request_transport.responseMessage().?, .{
                 .status = .ok,
                 .extra_headers = header_buf[0..header_len],
             });
@@ -2180,11 +2378,19 @@ pub const Server = struct {
     /// Send a notification to the client
     pub fn sendNotification(self: *Self, io: std.Io, allocator: std.mem.Allocator, method: []const u8, params: ?std.json.Value) !void {
         const notification = jsonrpc.createNotification(method, params);
-        // Server-initiated notifications are not a reply to any request, so
-        // they go to the server-wide transport. Over HTTP that means stdio-style
-        // single-transport deployments only; per-session push needs the GET
-        // stream, which is not implemented yet.
-        try self.sendVia(self.transport, io, allocator, .{ .notification = notification });
+        const json = jsonrpc.serializeMessage(allocator, .{ .notification = notification }) catch {
+            self.logError(io, "Failed to serialize notification");
+            return;
+        };
+        defer allocator.free(json);
+
+        // Server-initiated notifications are not a reply to any request. stdio
+        // and custom transports have one client on the server-wide transport;
+        // HTTP clients pick them up on their `GET` event stream.
+        if (self.transport) |t| {
+            t.send(io, allocator, json) catch self.logError(io, "Failed to send notification");
+        }
+        self.broadcastEvent(io, json);
     }
 
     /// Send a log message notification
@@ -2555,7 +2761,7 @@ test "HttpRequestTransport response outlives the per-message arena" {
 
         // Read the response after handleMessage has returned, i.e. after its
         // arena has been destroyed. This is the use-after-free.
-        const response = request_transport.response_message orelse
+        const response = request_transport.responseMessage() orelse
             return error.NoResponseProduced;
         try std.testing.expect(std.mem.indexOf(u8, response, "\"jsonrpc\":\"2.0\"") != null);
     }
@@ -2580,7 +2786,7 @@ test "HttpRequestTransport replaces an earlier response without leaking" {
     // Destroying the scratch arena must not invalidate the stored response.
     arena.deinit();
 
-    try std.testing.expectEqualStrings("second", request_transport.response_message.?);
+    try std.testing.expectEqualStrings("second", request_transport.responseMessage().?);
 }
 
 test "isLoopbackHost recognises loopback forms" {
@@ -2717,7 +2923,7 @@ fn testRoundTrip(server: *Server, session: *Session, io: std.Io, message: []cons
     defer session.reply = previous_reply;
 
     try server.handleMessage(session, io, std.testing.allocator, message);
-    const response = request_transport.response_message orelse return error.NoResponseProduced;
+    const response = request_transport.responseMessage() orelse return error.NoResponseProduced;
     return std.testing.allocator.dupe(u8, response);
 }
 
@@ -2972,8 +3178,8 @@ test "a response goes to the requesting session's reply sink" {
 
     try server.handleMessage(a, io, std.testing.allocator, test_initialize_message);
 
-    try std.testing.expect(sink_a.response_message != null);
-    try std.testing.expect(sink_b.response_message == null);
+    try std.testing.expect(sink_a.responseMessage() != null);
+    try std.testing.expect(sink_b.responseMessage() == null);
 }
 
 test "an idle sweep does not free a session that is currently being served" {
@@ -3189,4 +3395,106 @@ test "retiring a busy session asks its in-flight work to stop" {
     try std.testing.expect(server.wasTerminated(io, created.plaintext_id));
 
     server.releaseSession(io, session);
+}
+
+test "a handler's progress notifications survive alongside its response" {
+    // Regression: `HttpRequestTransport` kept only the most recent message and
+    // freed the rest, so everything a handler emitted before its result was
+    // silently dropped.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var transport: HttpRequestTransport = .{ .owner_allocator = std.testing.allocator };
+    defer transport.deinit();
+
+    try transport.send(io, std.testing.allocator, "progress-1");
+    try transport.send(io, std.testing.allocator, "progress-2");
+    try transport.send(io, std.testing.allocator, "result");
+
+    try std.testing.expectEqual(@as(usize, 3), transport.messages.items.len);
+    try std.testing.expectEqualStrings("progress-1", transport.messages.items[0]);
+    try std.testing.expectEqualStrings("result", transport.responseMessage().?);
+}
+
+test "SSE frames carry event ids and cannot be forged by an embedded newline" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+
+    try Server.appendSseEvent(std.testing.allocator, &body, 7, "{\"a\":1}");
+    try std.testing.expectEqualStrings("id: 7\ndata: {\"a\":1}\n\n", body.items);
+
+    // A newline inside a message must not end the frame and start a new one.
+    body.clearRetainingCapacity();
+    try Server.appendSseEvent(std.testing.allocator, &body, 8, "line1\nline2");
+    try std.testing.expectEqualStrings("id: 8\ndata: line1\ndata: line2\n\n", body.items);
+}
+
+test "session events are numbered and retained for resumption" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const session = try testRegisterSession(&server, io);
+
+    try std.testing.expectEqual(@as(u64, 1), try session.pushEvent(std.testing.allocator, "one"));
+    try std.testing.expectEqual(@as(u64, 2), try session.pushEvent(std.testing.allocator, "two"));
+
+    // What a stream resuming from `Last-Event-ID: 1` would send.
+    var resumed: std.ArrayList([]const u8) = .empty;
+    defer resumed.deinit(std.testing.allocator);
+    for (session.replay.items) |event| {
+        if (event.id <= 1) continue;
+        try resumed.append(std.testing.allocator, event.data);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resumed.items.len);
+    try std.testing.expectEqualStrings("two", resumed.items[0]);
+}
+
+test "the replay buffer is bounded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const session = try testRegisterSession(&server, io);
+
+    var i: usize = 0;
+    while (i < Session.max_replay_events + 10) : (i += 1) {
+        _ = try session.pushEvent(std.testing.allocator, "event");
+    }
+
+    try std.testing.expectEqual(Session.max_replay_events, session.replay.items.len);
+    // Ids keep advancing, so a client can tell it missed some.
+    try std.testing.expectEqual(@as(u64, Session.max_replay_events + 10), session.event_seq);
+    try std.testing.expectEqual(@as(u64, 11), session.replay.items[0].id);
+}
+
+test "server notifications reach every live session's stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const a = try testRegisterSession(&server, io);
+    const b = try testRegisterSession(&server, io);
+
+    try server.sendNotification(io, std.testing.allocator, "notifications/tools/list_changed", null);
+
+    try std.testing.expectEqual(@as(usize, 1), a.replay.items.len);
+    try std.testing.expectEqual(@as(usize, 1), b.replay.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, a.replay.items[0].data, "list_changed") != null);
+
+    // A session on its way out is not queued more work.
+    b.closing = true;
+    try server.sendNotification(io, std.testing.allocator, "notifications/tools/list_changed", null);
+    try std.testing.expectEqual(@as(usize, 2), a.replay.items.len);
+    try std.testing.expectEqual(@as(usize, 1), b.replay.items.len);
 }
