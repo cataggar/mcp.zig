@@ -169,6 +169,16 @@ pub const ServerConfig = struct {
     supported_protocol_versions: ?[]const []const u8 = null,
     /// How to answer a client asking for a version this server does not speak.
     ///
+    /// Threads serving `tools/call` concurrently on the stdio and custom
+    /// transports.
+    ///
+    /// `0` (the default) keeps the message loop strictly sequential, so one
+    /// slow tool blocks every other request including `ping` and the
+    /// cancellation meant to stop it. Any positive value starts that many
+    /// worker threads; a call that arrives with all of them busy is refused
+    /// with `-32000 Server busy` rather than queued, so a client learns
+    /// immediately instead of waiting behind work it cannot see.
+    max_tool_workers: usize = 0,
     /// `false` (the default) follows the spec: negotiate down by replying with
     /// the newest version this server supports and let the client decide
     /// whether to continue. `true` fails the handshake with `-32602` instead,
@@ -334,9 +344,11 @@ pub const Session = struct {
     /// dropped as soon as the response is sent, so this holds only genuinely
     /// concurrent work rather than growing for the life of the session.
     inflight: std.StringHashMap(*RequestContext),
-    /// Guards `inflight`. Requests on one session are serialized today, but
-    /// the table is the seam a worker pool would contend on.
+    /// Guards `inflight`, which a worker pool contends on.
     inflight_mutex: std.Io.Mutex = .init,
+    /// Guards `tasks`, which several tool calls on one session may mutate at
+    /// once when a worker pool is running.
+    tasks_mutex: std.Io.Mutex = .init,
     /// Seconds since the epoch when this session was last used.
     last_seen_s: i64 = 0,
 
@@ -542,6 +554,14 @@ pub const Server = struct {
     /// after every built-in has declined. Keys are owned.
     method_handlers: std.StringHashMap(RegistryEntry(MethodHandler)),
     notification_method_handlers: std.StringHashMap(RegistryEntry(NotificationMethodHandler)),
+    /// Serializes writes to a shared transport across worker threads.
+    write_mutex: std.Io.Mutex = .init,
+    /// Tool calls currently occupying a worker. Guarded by `worker_mutex`.
+    workers_in_flight: usize = 0,
+    worker_mutex: std.Io.Mutex = .init,
+    /// Set when a worker pool is running, so slot accounting can lock without
+    /// threading `io` through every call site.
+    io_for_workers: ?std.Io = null,
     /// Single implicit session for stdio and custom transports, which carry
     /// exactly one client and have no way to convey a session id.
     implicit_session: Session,
@@ -700,6 +720,23 @@ pub const Server = struct {
             try out.print(allocator, "data: {s}\n", .{line});
         }
         try out.appendSlice(allocator, "\n");
+    }
+
+    /// Refuses a tool call because every worker is occupied.
+    fn sendServerBusy(
+        self: *Self,
+        session: *Session,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        id: types.RequestId,
+    ) !void {
+        const error_response = jsonrpc.createErrorResponse(
+            id,
+            jsonrpc.ErrorCode.SERVER_BUSY,
+            "Server busy",
+            .{ .string = "all tool workers are occupied" },
+        );
+        try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
     }
 
     /// Answers a request whose handler stopped because it was cancelled.
@@ -1970,11 +2007,174 @@ pub const Server = struct {
         };
     }
 
+    /// One queued tool call, owned by the pool until a worker has run it.
+    const ToolWork = struct {
+        server: *Self,
+        session: *Session,
+        message: []const u8,
+    };
+
+    /// A fixed set of threads that run `tools/call` off the message loop.
+    ///
+    /// There is no unbounded queue: admission is refused once every worker is
+    /// busy, so a client is told `-32000` immediately rather than waiting
+    /// behind work it cannot see. The queue exists only to hand accepted work
+    /// to whichever thread wakes up first.
+    const ToolWorkerPool = struct {
+        server: *Self,
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        available: std.Io.Semaphore = .{},
+        queue: std.ArrayList(*ToolWork) = .empty,
+        stopping: bool = false,
+        threads: []std.Thread = &.{},
+
+        fn start(self: *ToolWorkerPool, count: usize) !void {
+            const allocator = self.server.allocator;
+            const threads = try allocator.alloc(std.Thread, count);
+            errdefer allocator.free(threads);
+
+            var started: usize = 0;
+            errdefer {
+                self.mutex.lockUncancelable(self.io);
+                self.stopping = true;
+                self.mutex.unlock(self.io);
+                for (threads[0..started]) |_| self.available.post(self.io);
+                for (threads[0..started]) |thread| thread.join();
+            }
+            while (started < count) : (started += 1) {
+                threads[started] = try std.Thread.spawn(.{}, workerLoop, .{self});
+            }
+            self.threads = threads;
+        }
+
+        fn stop(self: *ToolWorkerPool) void {
+            self.mutex.lockUncancelable(self.io);
+            self.stopping = true;
+            self.mutex.unlock(self.io);
+            // One post per thread, so every one wakes to see `stopping` even
+            // if the queue is empty.
+            for (self.threads) |_| self.available.post(self.io);
+            for (self.threads) |thread| thread.join();
+            self.server.allocator.free(self.threads);
+            self.threads = &.{};
+
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            for (self.queue.items) |work| self.discard(work);
+            self.queue.deinit(self.server.allocator);
+            self.queue = .empty;
+        }
+
+        fn deinit(self: *ToolWorkerPool) void {
+            self.stop();
+        }
+
+        fn discard(self: *ToolWorkerPool, work: *ToolWork) void {
+            const allocator = self.server.allocator;
+            allocator.free(work.message);
+            allocator.destroy(work);
+            self.server.releaseWorkerSlot();
+        }
+
+        /// Takes a worker slot and queues `message`, or reports that every
+        /// worker is busy.
+        fn submit(self: *ToolWorkerPool, session: *Session, message: []const u8) !void {
+            if (!self.server.reserveWorkerSlot()) return error.WorkersBusy;
+            errdefer self.server.releaseWorkerSlot();
+
+            const allocator = self.server.allocator;
+            const owned = try allocator.dupe(u8, message);
+            errdefer allocator.free(owned);
+            const work = try allocator.create(ToolWork);
+            errdefer allocator.destroy(work);
+            work.* = .{ .server = self.server, .session = session, .message = owned };
+
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.stopping) return error.ServerStopping;
+            try self.queue.append(allocator, work);
+            self.available.post(self.io);
+        }
+
+        fn workerLoop(self: *ToolWorkerPool) void {
+            while (true) {
+                self.available.waitUncancelable(self.io);
+
+                self.mutex.lockUncancelable(self.io);
+                const work: ?*ToolWork = if (self.queue.items.len > 0) self.queue.orderedRemove(0) else null;
+                const should_stop = work == null and self.stopping;
+                self.mutex.unlock(self.io);
+
+                if (work) |item| {
+                    self.run(item);
+                } else if (should_stop) {
+                    return;
+                }
+            }
+        }
+
+        fn run(self: *ToolWorkerPool, work: *ToolWork) void {
+            const allocator = self.server.allocator;
+            defer {
+                allocator.free(work.message);
+                allocator.destroy(work);
+                self.server.releaseWorkerSlot();
+            }
+            // A tool that fails is already answered inside `handleMessage`;
+            // reaching here means the failure was the server's own, and there
+            // is no id to attribute it to without parsing again.
+            self.server.handleMessage(work.session, self.io, allocator, work.message) catch {
+                self.server.logError(self.io, "Tool worker failed to handle a message");
+            };
+        }
+    };
+
+    fn reserveWorkerSlot(self: *Self) bool {
+        self.worker_mutex.lockUncancelable(self.io_for_workers.?);
+        defer self.worker_mutex.unlock(self.io_for_workers.?);
+        if (self.workers_in_flight >= self.config.max_tool_workers) return false;
+        self.workers_in_flight += 1;
+        return true;
+    }
+
+    fn releaseWorkerSlot(self: *Self) void {
+        self.worker_mutex.lockUncancelable(self.io_for_workers.?);
+        defer self.worker_mutex.unlock(self.io_for_workers.?);
+        self.workers_in_flight -= 1;
+    }
+
+    /// The id and method of `message`, when it is a request worth routing to a
+    /// worker. Parsing is skipped entirely unless the method name appears.
+    fn toolCallRequestId(allocator: std.mem.Allocator, message: []const u8) ?types.RequestId {
+        if (std.mem.indexOf(u8, message, "tools/call") == null) return null;
+        const parsed = jsonrpc.parseMessage(allocator, message) catch return null;
+        defer parsed.deinit();
+        return switch (parsed.message) {
+            .request => |request| if (std.mem.eql(u8, request.method, "tools/call"))
+                switch (request.id) {
+                    .string => |text| .{ .string = text },
+                    .integer => |number| .{ .integer = number },
+                }
+            else
+                null,
+            else => null,
+        };
+    }
+
     /// Main message processing loop
     fn messageLoop(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
         // stdio and custom transports carry exactly one client, so they share
         // the implicit session for the lifetime of the process.
         const session = &self.implicit_session;
+
+        var pool: ToolWorkerPool = .{ .server = self, .io = io };
+        defer pool.deinit();
+        if (self.config.max_tool_workers > 0) {
+            self.io_for_workers = io;
+            try pool.start(self.config.max_tool_workers);
+        }
+
         while (self.lifecycle == .running) {
             const message_data = self.transport.?.receive(io, allocator) catch |err| {
                 switch (err) {
@@ -1997,6 +2197,22 @@ pub const Server = struct {
 
             if (message_data) |data| {
                 defer allocator.free(data);
+
+                if (self.config.max_tool_workers > 0) {
+                    // Only tool calls go to a worker. Everything else stays on
+                    // this thread so ordering of the handshake is preserved and
+                    // a cancellation is never queued behind the call it stops.
+                    var scratch: std.heap.ArenaAllocator = .init(allocator);
+                    defer scratch.deinit();
+                    if (toolCallRequestId(scratch.allocator(), data)) |id| {
+                        pool.submit(session, data) catch |err| switch (err) {
+                            error.WorkersBusy => try self.sendServerBusy(session, io, allocator, id),
+                            else => return err,
+                        };
+                        continue;
+                    }
+                }
+
                 try self.handleMessage(session, io, allocator, data);
             }
         }
@@ -2417,7 +2633,10 @@ pub const Server = struct {
                 }
 
                 var status_message: ?[]const u8 = null;
-                if (session.tasks.count() >= self.max_tasks_per_session) {
+                session.tasks_mutex.lockUncancelable(io);
+                const task_count = session.tasks.count();
+                session.tasks_mutex.unlock(io);
+                if (task_count >= self.max_tasks_per_session) {
                     const error_response = jsonrpc.createErrorResponse(
                         request.id,
                         jsonrpc.ErrorCode.INTERNAL_ERROR,
@@ -2450,6 +2669,8 @@ pub const Server = struct {
                     .pollInterval = null,
                 };
 
+                session.tasks_mutex.lockUncancelable(io);
+                defer session.tasks_mutex.unlock(io);
                 try session.tasks.put(task_id, .{ .task = task, .result_json = result_json });
 
                 const task_obj = try buildTaskObject(allocator, task);
@@ -3075,6 +3296,10 @@ pub const Server = struct {
                 return;
             };
             defer allocator.free(json);
+            // Workers share one transport, and a message interleaved with
+            // another is not a message any more.
+            self.write_mutex.lockUncancelable(io);
+            defer self.write_mutex.unlock(io);
             t.send(io, allocator, json) catch {
                 self.logError(io, "Failed to send response");
                 return;
@@ -4812,4 +5037,253 @@ test "registering a custom method twice replaces the handler without leaking the
     try server.onMethod("shutdown", &second, CustomMethodProbe.shutdown);
     try std.testing.expectEqual(@as(usize, 1), server.method_handlers.count());
     try std.testing.expectEqual(@as(?*anyopaque, &second), server.method_handlers.get("shutdown").?.ctx);
+}
+
+fn sleepMs(io: std.Io) void {
+    io.sleep(.fromMilliseconds(1), .awake) catch {};
+}
+
+/// A transport that replays a fixed script of inbound messages and records
+/// everything the server sends, so the message loop can be driven from a test.
+const ScriptedTransport = struct {
+    allocator: std.mem.Allocator,
+    inbox: []const []const u8,
+    index: usize = 0,
+    finish: std.atomic.Value(bool) = .init(false),
+    sent: std.ArrayList([]const u8) = .empty,
+    mutex: std.Io.Mutex = .init,
+    mutex_io: std.Io,
+
+    fn deinit(self: *ScriptedTransport) void {
+        for (self.sent.items) |message| self.allocator.free(message);
+        self.sent.deinit(self.allocator);
+    }
+
+    /// Whether a response mentioning `needle` has been sent.
+    fn sawResponse(self: *ScriptedTransport, needle: []const u8) bool {
+        self.mutex.lockUncancelable(self.mutex_io);
+        defer self.mutex.unlock(self.mutex_io);
+        for (self.sent.items) |message| {
+            if (std.mem.indexOf(u8, message, needle) != null) return true;
+        }
+        return false;
+    }
+
+    fn responseCount(self: *ScriptedTransport) usize {
+        self.mutex.lockUncancelable(self.mutex_io);
+        defer self.mutex.unlock(self.mutex_io);
+        return self.sent.items.len;
+    }
+
+    fn send(self: *ScriptedTransport, _: std.Io, _: std.mem.Allocator, message: []const u8) transport_mod.Transport.SendError!void {
+        self.mutex.lockUncancelable(self.mutex_io);
+        defer self.mutex.unlock(self.mutex_io);
+        const owned = self.allocator.dupe(u8, message) catch return transport_mod.Transport.SendError.OutOfMemory;
+        errdefer self.allocator.free(owned);
+        self.sent.append(self.allocator, owned) catch return transport_mod.Transport.SendError.OutOfMemory;
+    }
+
+    fn receive(self: *ScriptedTransport, _: std.Io, allocator: std.mem.Allocator) transport_mod.Transport.ReceiveError!?[]const u8 {
+        if (self.index < self.inbox.len) {
+            defer self.index += 1;
+            return allocator.dupe(u8, self.inbox[self.index]) catch return transport_mod.Transport.ReceiveError.OutOfMemory;
+        }
+        if (self.finish.load(.acquire)) return transport_mod.Transport.ReceiveError.EndOfStream;
+        // Nothing to deliver yet; yield so the loop does not spin hot while the
+        // test decides what happens next.
+        sleepMs(self.mutex_io);
+        return null;
+    }
+
+    fn close(_: *ScriptedTransport) void {}
+
+    fn transport(self: *ScriptedTransport) transport_mod.Transport {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .send = sendVtable,
+                .receive = receiveVtable,
+                .close = closeVtable,
+                .deinit = deinitVtable,
+            },
+        };
+    }
+
+    fn sendVtable(ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, message: []const u8) transport_mod.Transport.SendError!void {
+        return send(@ptrCast(@alignCast(ptr)), io, allocator, message);
+    }
+    fn receiveVtable(ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator) transport_mod.Transport.ReceiveError!?[]const u8 {
+        return receive(@ptrCast(@alignCast(ptr)), io, allocator);
+    }
+    fn closeVtable(ptr: *anyopaque) void {
+        close(@ptrCast(@alignCast(ptr)));
+    }
+    fn deinitVtable(_: *anyopaque, _: std.mem.Allocator) void {}
+};
+
+/// A tool that does not return until the test lets it.
+const GatedTool = struct {
+    entered: std.atomic.Value(usize) = .init(0),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn handler(
+        ctx: ?*anyopaque,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        _: ?std.json.Value,
+    ) tools_mod.ToolError!tools_mod.ToolResult {
+        const self: *GatedTool = @ptrCast(@alignCast(ctx.?));
+        _ = self.entered.fetchAdd(1, .acq_rel);
+        while (!self.release.load(.acquire)) sleepMs(io);
+        return tools_mod.textResult(allocator, "done") catch return tools_mod.ToolError.OutOfMemory;
+    }
+};
+
+const LoopRunner = struct {
+    server: *Server,
+    io: std.Io,
+    transport: transport_mod.Transport,
+
+    fn run(self: *LoopRunner) void {
+        self.server.runWithTransport(self.io, std.testing.allocator, self.transport) catch {};
+    }
+};
+
+const handshake_message =
+    \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
+;
+
+/// Spins until `condition` holds, failing rather than hanging CI forever.
+fn waitFor(io: std.Io, context: anytype, comptime condition: fn (@TypeOf(context)) bool) !void {
+    var waited_ms: usize = 0;
+    while (!condition(context)) {
+        if (waited_ms > 10_000) return error.TimedOut;
+        sleepMs(io);
+        waited_ms += 1;
+    }
+}
+
+test "a slow tool no longer blocks the requests behind it" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1", .max_tool_workers = 2 });
+    defer server.deinit();
+
+    var gated: GatedTool = .{};
+    try server.addTool(.{ .name = "slow", .description = "waits", .handler = GatedTool.handler, .user_data = &gated });
+
+    const inbox = [_][]const u8{
+        handshake_message,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"ping"}
+        ,
+    };
+    var scripted: ScriptedTransport = .{ .allocator = std.testing.allocator, .inbox = &inbox, .mutex_io = io };
+    defer scripted.deinit();
+
+    var runner: LoopRunner = .{ .server = &server, .io = io, .transport = scripted.transport() };
+    const loop = try std.Thread.spawn(.{}, LoopRunner.run, .{&runner});
+
+    // The ping is answered while the tool is still inside its handler, which
+    // is the whole point: a sequential loop could not have replied yet.
+    try waitFor(io, &scripted, struct {
+        fn f(t: *ScriptedTransport) bool {
+            return t.sawResponse("\"id\":3");
+        }
+    }.f);
+    try std.testing.expectEqual(@as(usize, 1), gated.entered.load(.acquire));
+    try std.testing.expect(!scripted.sawResponse("\"id\":2"));
+
+    gated.release.store(true, .release);
+    try waitFor(io, &scripted, struct {
+        fn f(t: *ScriptedTransport) bool {
+            return t.sawResponse("\"id\":2");
+        }
+    }.f);
+
+    scripted.finish.store(true, .release);
+    loop.join();
+}
+
+test "a tool call is refused when every worker is occupied" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1", .max_tool_workers = 1 });
+    defer server.deinit();
+
+    var gated: GatedTool = .{};
+    try server.addTool(.{ .name = "slow", .description = "waits", .handler = GatedTool.handler, .user_data = &gated });
+
+    const inbox = [_][]const u8{
+        handshake_message,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{}}}
+        ,
+    };
+    var scripted: ScriptedTransport = .{ .allocator = std.testing.allocator, .inbox = &inbox, .mutex_io = io };
+    defer scripted.deinit();
+
+    var runner: LoopRunner = .{ .server = &server, .io = io, .transport = scripted.transport() };
+    const loop = try std.Thread.spawn(.{}, LoopRunner.run, .{&runner});
+
+    // Refused, not queued: the client hears about it immediately.
+    try waitFor(io, &scripted, struct {
+        fn f(t: *ScriptedTransport) bool {
+            return t.sawResponse("-32000");
+        }
+    }.f);
+    try std.testing.expect(scripted.sawResponse("Server busy"));
+    try std.testing.expect(!scripted.sawResponse("\"id\":2"));
+
+    gated.release.store(true, .release);
+    try waitFor(io, &scripted, struct {
+        fn f(t: *ScriptedTransport) bool {
+            return t.sawResponse("\"id\":2");
+        }
+    }.f);
+
+    scripted.finish.store(true, .release);
+    loop.join();
+}
+
+test "without workers the loop stays sequential and refuses nothing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try server.addTool(.{ .name = "fast", .description = "x", .handler = testNoopTool });
+
+    const inbox = [_][]const u8{
+        handshake_message,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fast","arguments":{}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fast","arguments":{}}}
+        ,
+    };
+    var scripted: ScriptedTransport = .{ .allocator = std.testing.allocator, .inbox = &inbox, .mutex_io = io };
+    defer scripted.deinit();
+
+    var runner: LoopRunner = .{ .server = &server, .io = io, .transport = scripted.transport() };
+    const loop = try std.Thread.spawn(.{}, LoopRunner.run, .{&runner});
+
+    try waitFor(io, &scripted, struct {
+        fn f(t: *ScriptedTransport) bool {
+            return t.responseCount() >= 3;
+        }
+    }.f);
+    scripted.finish.store(true, .release);
+    loop.join();
+
+    try std.testing.expect(scripted.sawResponse("\"id\":2"));
+    try std.testing.expect(scripted.sawResponse("\"id\":3"));
+    try std.testing.expect(!scripted.sawResponse("-32000"));
+    try std.testing.expectEqual(@as(usize, 0), server.workers_in_flight);
 }
