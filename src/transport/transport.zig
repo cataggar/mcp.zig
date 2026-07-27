@@ -298,7 +298,7 @@ pub const HttpTransport = struct {
     /// Rejects anything that could inject a second header, or a body, into the
     /// request head. Config files are a normal source of these values, so this
     /// is an untrusted-input boundary.
-    fn validateHeader(header: std.http.Header) HeaderError!void {
+    pub fn validateHeader(header: std.http.Header) HeaderError!void {
         if (header.name.len == 0) return error.InvalidHeaderName;
         for (header.name) |c| {
             if (!isTokenChar(c)) return error.InvalidHeaderName;
