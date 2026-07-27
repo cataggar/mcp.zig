@@ -5,6 +5,7 @@
 //! resources, prompts, tasks, and all standard MCP methods.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const http = std.http;
 
 const jsonrpc = @import("../protocol/jsonrpc.zig");
@@ -194,6 +195,21 @@ pub const Session = struct {
     }
 };
 
+/// Winsock socket options, which `std.posix` refuses to expose on Windows.
+const winsock = struct {
+    const sol_socket: i32 = 0xffff;
+    const so_sndtimeo: i32 = 0x1005;
+    const so_rcvtimeo: i32 = 0x1006;
+
+    extern "ws2_32" fn setsockopt(
+        s: std.Io.net.Socket.Handle,
+        level: i32,
+        optname: i32,
+        optval: [*]const u8,
+        optlen: i32,
+    ) callconv(.winapi) i32;
+};
+
 /// MCP Server that handles client connections and routes requests
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -228,6 +244,11 @@ pub const Server = struct {
     /// accepted connections wait for a slot rather than spawning unbounded
     /// threads.
     max_connections: usize = 64,
+    /// Listening socket, published while `runHttp` is active so `shutdown` can
+    /// unblock a parked `accept` from another thread.
+    http_listener: ?*std.Io.net.Server = null,
+    /// Address the listener is bound to, used to wake a parked `accept`.
+    http_bind_address: ?std.Io.net.IpAddress = null,
     pub const max_http_body_size: usize = 4 * 1024 * 1024;
 
     const Self = @This();
@@ -464,6 +485,23 @@ pub const Server = struct {
         /// door on web pages the user happens to visit.
         allowed_origins: []const []const u8 = &.{},
 
+        /// Read and write deadline applied to every connection, in seconds.
+        ///
+        /// Without it a client can open a socket, dribble out a request head
+        /// forever and hold a connection slot indefinitely. Set to 0 to
+        /// disable, which is only sensible behind a proxy that imposes its own.
+        connection_timeout_s: u32 = 30,
+
+        /// How long `shutdown` waits for in-flight connections to drain, in
+        /// milliseconds, before returning anyway.
+        shutdown_grace_ms: u64 = 5_000,
+
+        /// Set `SO_REUSEADDR` on the listening socket.
+        ///
+        /// On by default: without it a restart fails with `AddressInUse` for
+        /// as long as the previous socket sits in `TIME_WAIT`.
+        reuse_address: bool = true,
+
         /// Shortest accepted token. Long enough that an online guessing attack
         /// against a high-entropy token is not worth attempting.
         pub const min_auth_token_len = 32;
@@ -555,14 +593,39 @@ pub const Server = struct {
             return error.AddressResolutionError;
         };
 
-        var listener = try std.Io.net.IpAddress.listen(&address, io, .{});
+        var listener = try std.Io.net.IpAddress.listen(&address, io, .{
+            .reuse_address = config.reuse_address,
+        });
         defer listener.deinit(io);
 
+        self.connections_mutex.lock(io) catch return error.Canceled;
+        self.http_listener = &listener;
+        self.http_bind_address = address;
+        self.connections_mutex.unlock(io);
+        defer {
+            self.connections_mutex.lock(io) catch {};
+            self.http_listener = null;
+            self.http_bind_address = null;
+            self.connections_mutex.unlock(io);
+        }
+
+        // Repeated accept failures must not become a hot spin loop.
+        var accept_backoff_ms: i64 = 0;
+
         while (self.lifecycle == .running) {
-            const stream = listener.accept(io) catch |err| {
-                std.log.err("HTTP accept failed: {s}", .{@errorName(err)});
-                continue;
+            const stream = listener.accept(io) catch |err| switch (err) {
+                // `shutdown` on the listening socket unblocks a parked accept.
+                error.SocketNotListening, error.Canceled => break,
+                else => {
+                    std.log.err("HTTP accept failed: {s}", .{@errorName(err)});
+                    accept_backoff_ms = nextAcceptBackoffMs(accept_backoff_ms);
+                    io.sleep(.fromMilliseconds(accept_backoff_ms), .awake) catch break;
+                    continue;
+                },
             };
+            accept_backoff_ms = 0;
+
+            _ = setSocketTimeouts(stream.socket.handle, config.connection_timeout_s);
 
             // Serve on its own thread so one slow client cannot stall every
             // other client behind it. At capacity we serve inline instead of
@@ -576,6 +639,84 @@ pub const Server = struct {
                 std.log.err("HTTP connection error: {s}", .{@errorName(err)});
             };
         }
+
+        self.drainConnections(io, config.shutdown_grace_ms);
+    }
+
+    /// Backoff schedule for repeated accept failures: 1ms doubling to 1s.
+    fn nextAcceptBackoffMs(current: i64) i64 {
+        if (current == 0) return 1;
+        return @min(current * 2, 1000);
+    }
+
+    /// Apply a read and write deadline to a connection.
+    ///
+    /// Best effort: a platform that rejects the option leaves the connection
+    /// without a deadline rather than dropping it, since the bounded connection
+    /// count already caps the damage.
+    fn setSocketTimeouts(handle: std.Io.net.Socket.Handle, seconds: u32) bool {
+        if (seconds == 0) return false;
+        const posix = std.posix;
+        if (builtin.os.tag == .windows) {
+            // `std.posix.setsockopt` is a compile error on Windows and std.Io
+            // exposes no socket options, so call Winsock directly. Windows
+            // takes a millisecond DWORD here, not a `timeval`.
+            const millis: u32 = seconds *| 1000;
+            const bytes = std.mem.asBytes(&millis);
+            if (winsock.setsockopt(handle, winsock.sol_socket, winsock.so_rcvtimeo, bytes.ptr, bytes.len) != 0) return false;
+            if (winsock.setsockopt(handle, winsock.sol_socket, winsock.so_sndtimeo, bytes.ptr, bytes.len) != 0) return false;
+        } else {
+            const timeout: posix.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
+            const bytes = std.mem.asBytes(&timeout);
+            posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, bytes) catch return false;
+            posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, bytes) catch return false;
+        }
+        return true;
+    }
+
+    /// Stop accepting new connections and unblock a parked `accept`.
+    ///
+    /// Safe to call from any thread, including a signal handler thread, which
+    /// is the point: without it the accept loop only notices a state change
+    /// after the next connection happens to arrive.
+    pub fn shutdown(self: *Self, io: std.Io) void {
+        self.lifecycle = .shutting_down;
+        self.connections_mutex.lock(io) catch return;
+        defer self.connections_mutex.unlock(io);
+        if (self.http_listener) |listener| {
+            // Documented by std as a concurrent cancellation mechanism for
+            // `accept`, which otherwise blocks until a client happens to connect.
+            // It does not unblock a parked `accept` on every platform, though,
+            // so also dial the listener: whichever mechanism works first wins,
+            // and the accept loop closes the wake-up connection and stops.
+            const listening: std.Io.net.Stream = .{ .socket = listener.socket };
+            listening.shutdown(io, .both) catch {};
+        }
+        const bind_address = self.http_bind_address;
+        self.connections_mutex.unlock(io);
+        if (bind_address) |addr| {
+            if (addr.getPort() != 0) {
+                if (std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream })) |stream| {
+                    stream.close(io);
+                } else |_| {}
+            }
+        }
+        self.connections_mutex.lock(io) catch return;
+    }
+
+    /// Wait for in-flight connections to finish, up to `grace_ms`.
+    fn drainConnections(self: *Self, io: std.Io, grace_ms: u64) void {
+        const poll_ms: i64 = 10;
+        var waited: u64 = 0;
+        while (waited < grace_ms) {
+            self.connections_mutex.lock(io) catch return;
+            const active = self.active_connections;
+            self.connections_mutex.unlock(io);
+            if (active == 0) return;
+            io.sleep(.fromMilliseconds(poll_ms), .awake) catch return;
+            waited += @intCast(poll_ms);
+        }
+        std.log.warn("HTTP shutdown grace period elapsed with connections still in flight", .{});
     }
 
     const ConnectionContext = struct {
@@ -2796,4 +2937,68 @@ test "connection slots are bounded" {
     try std.testing.expect(server.tryAcquireConnectionSlot(io));
     server.releaseConnectionSlot(io);
     server.releaseConnectionSlot(io);
+}
+
+test "accept backoff grows and is capped" {
+    // A bare `continue` on accept failure turns a persistently failing listener
+    // into a hot spin loop.
+    try std.testing.expectEqual(@as(i64, 1), Server.nextAcceptBackoffMs(0));
+    try std.testing.expectEqual(@as(i64, 2), Server.nextAcceptBackoffMs(1));
+    try std.testing.expectEqual(@as(i64, 1000), Server.nextAcceptBackoffMs(512));
+    try std.testing.expectEqual(@as(i64, 1000), Server.nextAcceptBackoffMs(1000));
+}
+
+test "shutdown unblocks a parked accept" {
+    // Regression: the accept loop only re-checked lifecycle between
+    // connections, so a server with no traffic could not be stopped at all.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    // A fixed port, because the wake-up connection has to be able to dial the
+    // listener back. `reuse_address` keeps a repeat run from tripping over
+    // `TIME_WAIT`.
+    const port: u16 = 47821;
+    const Runner = struct {
+        fn run(s: *Server, run_io: std.Io, allocator: std.mem.Allocator, p: u16) void {
+            s.runHttp(run_io, allocator, .{ .port = p, .shutdown_grace_ms = 200 }) catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &server, io, std.testing.allocator, port });
+
+    // Wait for the listener to be published, i.e. accept is parked.
+    var spins: usize = 0;
+    while (spins < 500) : (spins += 1) {
+        server.connections_mutex.lock(io) catch unreachable;
+        const listening = server.http_listener != null;
+        server.connections_mutex.unlock(io);
+        if (listening) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    try std.testing.expect(spins < 500);
+
+    server.shutdown(io);
+    // Hangs forever without the listener shutdown, since no client ever connects.
+    thread.join();
+    try std.testing.expectEqual(Lifecycle.shutting_down, server.lifecycle);
+}
+
+test "connection timeouts are applied to accepted sockets" {
+    if (builtin.os.tag == .windows) return;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const address = std.Io.net.Ip4Address.loopback(0);
+    var listener = try std.Io.net.IpAddress.listen(&.{ .ip4 = address }, io, .{});
+    defer listener.deinit(io);
+
+    // The kernel accepted the deadline for a real TCP socket.
+    try std.testing.expect(Server.setSocketTimeouts(listener.socket.handle, 7));
+    // Disabled means disabled: no option is set at all.
+    try std.testing.expect(!Server.setSocketTimeouts(listener.socket.handle, 0));
 }
