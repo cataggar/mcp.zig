@@ -55,7 +55,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, process_args: std.process.Args)
     std.debug.print("  Protocol: {s}\n", .{client.negotiated_version.?});
 
     // List the tools the server offers.
-    const tools = try client.listTools(io, allocator);
+    const tools = try client.listTools(io, allocator, .{});
     defer tools.deinit();
 
     const list = tools.get("tools") orelse return error.MissingTools;

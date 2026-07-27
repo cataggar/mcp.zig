@@ -67,7 +67,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator, process_args: std.process.Args)
     // In a real implementation, you would:
     try client.connectStdio(io, allocator, server_command.?, &.{});
 
-    const tools = try client.listTools(io, allocator);
+    const tools = try client.listAllTools(io, allocator);
     defer tools.deinit();
 
     const result = try client.callTool(io, allocator, "greet", args);

@@ -27,10 +27,19 @@ fn run(io: std.Io, allocator: std.mem.Allocator) !void {
     const getenv_schema = try buildStringSchema(sa, "name", "Environment variable to read");
     const read_schema = try buildStringSchema(sa, "path", "Path to read, resolved against the cwd");
 
+    // Driven by the environment so the pagination tests can reuse this
+    // fixture without teaching it argument parsing.
+    const page_size = blk: {
+        const map = process_environ orelse break :blk 0;
+        const raw = map.get("MCP_ZIG_PAGE_SIZE") orelse break :blk 0;
+        break :blk std.fmt.parseInt(usize, raw, 10) catch 0;
+    };
+
     var server: mcp.Server = .init(allocator, .{
         .name = "env-probe-server",
         .version = "1.0.0",
         .description = "Reports the spawned process's environment and working directory",
+        .page_size = page_size,
     });
     defer server.deinit();
 

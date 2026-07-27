@@ -117,6 +117,29 @@ pub const Response = struct {
     }
 };
 
+/// Selects one page of a `*/list` response.
+pub const ListOptions = struct {
+    /// Cursor from a previous page's `nextCursor`. Null requests the first
+    /// page. Cursors are opaque; do not construct one.
+    cursor: ?[]const u8 = null,
+};
+
+/// The concatenated items of every page of a `*/list` method.
+///
+/// `items` are views into `responses`, which are retained so the values stay
+/// valid until `deinit`.
+pub const PagedItems = struct {
+    allocator: std.mem.Allocator,
+    responses: []Response,
+    items: []std.json.Value,
+
+    pub fn deinit(self: PagedItems) void {
+        for (self.responses) |r| r.deinit();
+        self.allocator.free(self.responses);
+        self.allocator.free(self.items);
+    }
+};
+
 /// A JSON-RPC error returned by the server.
 pub const ServerError = struct {
     code: i64,
@@ -126,6 +149,10 @@ pub const ServerError = struct {
 /// How many consecutive empty reads to tolerate while waiting for a response
 /// before giving up with `error.NoResponse`.
 const max_empty_reads = 128;
+
+/// Upper bound on pages walked by the `listAll*` helpers. A server that never
+/// stops emitting `nextCursor` must not hang the caller.
+const max_list_pages = 1024;
 
 /// Connection state of the client.
 pub const ClientState = enum {
@@ -607,9 +634,96 @@ pub const Client = struct {
         try t.send(io, allocator, json);
     }
 
+    /// Issues a `*/list` request carrying the caller's cursor, if any.
+    fn requestPage(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        options: ListOptions,
+    ) !Response {
+        const cursor = options.cursor orelse return self.request(io, allocator, method, null);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var params: std.json.ObjectMap = .empty;
+        try params.put(arena.allocator(), "cursor", .{ .string = cursor });
+        return self.request(io, allocator, method, .{ .object = params });
+    }
+
+    /// Walks every page of a `*/list` method and returns the concatenated
+    /// items under `items_key`.
+    fn requestAllPages(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        items_key: []const u8,
+    ) !PagedItems {
+        var responses: std.ArrayList(Response) = .empty;
+        errdefer {
+            for (responses.items) |r| r.deinit();
+            responses.deinit(allocator);
+        }
+        var items: std.ArrayList(std.json.Value) = .empty;
+        errdefer items.deinit(allocator);
+
+        var cursor: ?[]const u8 = null;
+        var pages: usize = 0;
+        while (true) {
+            const response = try self.requestPage(io, allocator, method, .{ .cursor = cursor });
+            try responses.append(allocator, response);
+            pages += 1;
+
+            if (response.get(items_key)) |value| switch (value) {
+                .array => |a| try items.appendSlice(allocator, a.items),
+                else => return error.InvalidResponse,
+            };
+
+            const next = switch (response.get("nextCursor") orelse .null) {
+                .string => |c| c,
+                else => break,
+            };
+            // A server that keeps handing back the same cursor, or that never
+            // stops, would otherwise spin here forever. Neither is something a
+            // caller can be expected to defend against.
+            if (cursor) |previous| {
+                if (std.mem.eql(u8, previous, next)) return error.CursorNotAdvancing;
+            }
+            if (pages >= max_list_pages) return error.TooManyPages;
+            cursor = next;
+        }
+
+        return .{
+            .allocator = allocator,
+            .responses = try responses.toOwnedSlice(allocator),
+            .items = try items.toOwnedSlice(allocator),
+        };
+    }
+
+    /// Requests every page of tools.
+    pub fn listAllTools(self: *Self, io: std.Io, allocator: std.mem.Allocator) !PagedItems {
+        return self.requestAllPages(io, allocator, "tools/list", "tools");
+    }
+
+    /// Requests every page of resources.
+    pub fn listAllResources(self: *Self, io: std.Io, allocator: std.mem.Allocator) !PagedItems {
+        return self.requestAllPages(io, allocator, "resources/list", "resources");
+    }
+
+    /// Requests every page of resource templates.
+    pub fn listAllResourceTemplates(self: *Self, io: std.Io, allocator: std.mem.Allocator) !PagedItems {
+        return self.requestAllPages(io, allocator, "resources/templates/list", "resourceTemplates");
+    }
+
+    /// Requests every page of prompts.
+    pub fn listAllPrompts(self: *Self, io: std.Io, allocator: std.mem.Allocator) !PagedItems {
+        return self.requestAllPages(io, allocator, "prompts/list", "prompts");
+    }
+
     /// Requests the list of available tools from the server.
-    pub fn listTools(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
-        return self.request(io, allocator, "tools/list", null);
+    pub fn listTools(self: *Self, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response {
+        return self.requestPage(io, allocator, "tools/list", options);
     }
 
     /// Invokes a tool on the server with optional arguments.
@@ -627,8 +741,8 @@ pub const Client = struct {
     }
 
     /// Requests the list of available resources from the server.
-    pub fn listResources(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
-        return self.request(io, allocator, "resources/list", null);
+    pub fn listResources(self: *Self, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response {
+        return self.requestPage(io, allocator, "resources/list", options);
     }
 
     /// Reads a resource from the server by URI.
@@ -656,13 +770,13 @@ pub const Client = struct {
     }
 
     /// Requests the list of resource templates from the server.
-    pub fn listResourceTemplates(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
-        return self.request(io, allocator, "resources/templates/list", null);
+    pub fn listResourceTemplates(self: *Self, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response {
+        return self.requestPage(io, allocator, "resources/templates/list", options);
     }
 
     /// Requests the list of available prompts from the server.
-    pub fn listPrompts(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
-        return self.request(io, allocator, "prompts/list", null);
+    pub fn listPrompts(self: *Self, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response {
+        return self.requestPage(io, allocator, "prompts/list", options);
     }
 
     /// Fetches a prompt by name with optional arguments.
@@ -864,7 +978,7 @@ test "connectStdio spawns a server and runs a real request/response session" {
     try std.testing.expectEqualStrings(protocol.VERSION, client.negotiated_version.?);
     try std.testing.expectEqualStrings("simple-server", client.serverInfo().?.object.get("name").?.string);
 
-    const tools = try client.listTools(io, allocator);
+    const tools = try client.listTools(io, allocator, .{});
     defer tools.deinit();
 
     var saw_greet = false;
@@ -1010,4 +1124,96 @@ test "an environment variable name containing '=' is rejected" {
     try std.testing.expectError(error.InvalidEnvironmentVariableName, buildEnvironMap(allocator, .{
         .env = &.{.{ .name = "BAD=NAME", .value = "x" }},
     }));
+}
+
+test "listAllTools walks every page of a paginating server" {
+    const build_options = @import("build_options");
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+
+    // The fixture exports two tools; one per page forces a real second round
+    // trip rather than a single page that happens to hold everything.
+    try client.connectStdioOptions(io, allocator, build_options.env_probe_server_path, .{
+        .env = &.{.{ .name = "MCP_ZIG_PAGE_SIZE", .value = "1" }},
+    });
+
+    const first = try client.listTools(io, allocator, .{});
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.get("tools").?.array.items.len);
+    try std.testing.expect(first.get("nextCursor") != null);
+
+    const all = try client.listAllTools(io, allocator);
+    defer all.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), all.items.len);
+    try std.testing.expectEqual(@as(usize, 2), all.responses.len);
+
+    var saw_getenv = false;
+    var saw_read = false;
+    for (all.items) |tool| {
+        const name = tool.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "getenv")) saw_getenv = true;
+        if (std.mem.eql(u8, name, "read_relative")) saw_read = true;
+    }
+    try std.testing.expect(saw_getenv and saw_read);
+}
+
+/// A transport that replays canned responses, so the page-walk guards can be
+/// driven against server behaviour a correct server would never produce.
+const ScriptedTransport = struct {
+    replies: []const []const u8,
+    next: usize = 0,
+
+    fn send(_: *ScriptedTransport, _: std.Io, _: std.mem.Allocator, _: []const u8) transport_mod.Transport.SendError!void {}
+
+    fn receive(self: *ScriptedTransport, _: std.Io, allocator: std.mem.Allocator) transport_mod.Transport.ReceiveError!?[]const u8 {
+        if (self.next >= self.replies.len) return null;
+        defer self.next += 1;
+        return allocator.dupe(u8, self.replies[self.next]) catch
+            return transport_mod.Transport.ReceiveError.OutOfMemory;
+    }
+
+    fn close(_: *ScriptedTransport) void {}
+
+    fn deinitFn(_: *anyopaque, _: std.mem.Allocator) void {}
+
+    const vtable: transport_mod.Transport.VTable = .{
+        .send = @ptrCast(&send),
+        .receive = @ptrCast(&receive),
+        .close = @ptrCast(&close),
+        .deinit = deinitFn,
+    };
+
+    fn transport(self: *ScriptedTransport) transport_mod.Transport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "the page walk refuses a cursor that never advances" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var scripted: ScriptedTransport = .{ .replies = &.{
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}],"nextCursor":"stuck"}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"a"}],"nextCursor":"stuck"}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"a"}],"nextCursor":"stuck"}}
+        ,
+    } };
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+    client.transport = scripted.transport();
+
+    try std.testing.expectError(error.CursorNotAdvancing, client.listAllTools(io, allocator));
 }
