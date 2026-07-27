@@ -99,7 +99,8 @@ it only once the last in-flight request finishes.
 Every accepted connection gets a `connection_timeout_s` read and write deadline,
 so a client cannot hold a connection slot by dribbling out a request head. This
 is best effort: a platform that rejects the socket option leaves the connection
-without a deadline rather than refusing it.
+without a deadline rather than refusing it. Windows deadlines go through Winsock
+directly, since `std.posix.setsockopt` is a compile error there.
 
 ### Shutdown
 

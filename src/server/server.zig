@@ -195,6 +195,21 @@ pub const Session = struct {
     }
 };
 
+/// Winsock socket options, which `std.posix` refuses to expose on Windows.
+const winsock = struct {
+    const sol_socket: i32 = 0xffff;
+    const so_sndtimeo: i32 = 0x1005;
+    const so_rcvtimeo: i32 = 0x1006;
+
+    extern "ws2_32" fn setsockopt(
+        s: std.Io.net.Socket.Handle,
+        level: i32,
+        optname: i32,
+        optval: [*]const u8,
+        optlen: i32,
+    ) callconv(.winapi) i32;
+};
+
 /// MCP Server that handles client connections and routes requests
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -639,10 +654,13 @@ pub const Server = struct {
         if (seconds == 0) return false;
         const posix = std.posix;
         if (builtin.os.tag == .windows) {
+            // `std.posix.setsockopt` is a compile error on Windows and std.Io
+            // exposes no socket options, so call Winsock directly. Windows
+            // takes a millisecond DWORD here, not a `timeval`.
             const millis: u32 = seconds *| 1000;
             const bytes = std.mem.asBytes(&millis);
-            posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, bytes) catch return false;
-            posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, bytes) catch return false;
+            if (winsock.setsockopt(handle, winsock.sol_socket, winsock.so_rcvtimeo, bytes.ptr, bytes.len) != 0) return false;
+            if (winsock.setsockopt(handle, winsock.sol_socket, winsock.so_sndtimeo, bytes.ptr, bytes.len) != 0) return false;
         } else {
             const timeout: posix.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
             const bytes = std.mem.asBytes(&timeout);
