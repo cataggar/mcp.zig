@@ -1560,6 +1560,67 @@ pub const Server = struct {
         try self.messageLoop(io, allocator);
     }
 
+    /// Everything a server produced in reply to one message.
+    ///
+    /// A handler may emit progress notifications before its result, so this is
+    /// a list rather than a single message.
+    pub const Reply = struct {
+        allocator: std.mem.Allocator,
+        /// In the order the server produced them. Empty for a notification, or
+        /// for a request the server chose not to answer.
+        messages: []const []const u8,
+
+        pub fn deinit(self: Reply) void {
+            for (self.messages) |message| self.allocator.free(message);
+            self.allocator.free(self.messages);
+        }
+
+        /// The response to a request, which is the last message produced.
+        pub fn response(self: Reply) ?[]const u8 {
+            if (self.messages.len == 0) return null;
+            return self.messages[self.messages.len - 1];
+        }
+    };
+
+    /// Handles one JSON-RPC message and returns what the server produced,
+    /// without involving a transport.
+    ///
+    /// This is the seam the transports themselves sit on. It exists so a host
+    /// that already owns its I/O can use the server, and so a test can assert
+    /// on the exact bytes a method produces without standing up a socket
+    /// first.
+    ///
+    /// Messages are allocated from `allocator` and owned by the returned
+    /// `Reply`. Uses the implicit session, the same one stdio and custom
+    /// transports use.
+    pub fn handleMessageAlloc(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        message: []const u8,
+    ) !Reply {
+        const session = &self.implicit_session;
+
+        var capture: HttpRequestTransport = .{ .owner_allocator = allocator };
+        errdefer capture.deinit();
+
+        // Held for the whole exchange so two callers cannot overwrite each
+        // other's sink, exactly as the http path does.
+        session.mutex.lock(io) catch return error.Canceled;
+        defer session.mutex.unlock(io);
+
+        const previous = session.reply;
+        session.reply = capture.transport();
+        defer session.reply = previous;
+
+        try self.handleMessage(session, io, allocator, message);
+
+        return .{
+            .allocator = allocator,
+            .messages = try capture.messages.toOwnedSlice(allocator),
+        };
+    }
+
     /// Main message processing loop
     fn messageLoop(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
         // stdio and custom transports carry exactly one client, so they share
@@ -3763,4 +3824,67 @@ test "paginateKeys resumes after a key that has since been removed" {
     try std.testing.expectEqual(@as(usize, 2), page.keys.len);
     try std.testing.expectEqualStrings("c", page.keys[0]);
     try std.testing.expectEqualStrings("d", page.keys[1]);
+}
+
+test "handleMessageAlloc answers a request without a transport" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    const init_reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
+    );
+    defer init_reply.deinit();
+    const init_body = init_reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, init_body, "\"protocolVersion\":\"2025-11-25\"") != null);
+
+    const ping_reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+    );
+    defer ping_reply.deinit();
+    const ping_body = ping_reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, ping_body, "\"id\":2") != null);
+}
+
+test "handleMessageAlloc produces nothing for a notification" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    );
+    defer reply.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reply.messages.len);
+    try std.testing.expect(reply.response() == null);
+}
+
+test "handleMessageAlloc leaves an existing reply sink in place" {
+    // The http path sets `session.reply` for the duration of a request; a
+    // caller reaching in must put back what it found rather than clearing it.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    var outer: HttpRequestTransport = .{ .owner_allocator = std.testing.allocator };
+    defer outer.deinit();
+    server.implicit_session.reply = outer.transport();
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"ping"}
+    );
+    defer reply.deinit();
+
+    try std.testing.expect(server.implicit_session.reply != null);
+    // The response went to the caller, not to the sink that was already there.
+    try std.testing.expectEqual(@as(usize, 0), outer.messages.items.len);
 }
