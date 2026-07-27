@@ -19,6 +19,9 @@ pub const Transport = struct {
         send: *const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, message: []const u8) SendError!void,
         receive: *const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator) ReceiveError!?[]const u8,
         close: *const fn (ptr: *anyopaque) void,
+        /// Release the implementation and the allocation holding it. Only
+        /// valid for transports the caller handed ownership of.
+        deinit: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
     };
 
     pub const SendError = error{
@@ -48,6 +51,11 @@ pub const Transport = struct {
     /// Closes the transport connection.
     pub fn close(self: Transport) void {
         self.vtable.close(self.ptr);
+    }
+
+    /// Releases the transport implementation and its allocation.
+    pub fn deinit(self: Transport, allocator: std.mem.Allocator) void {
+        self.vtable.deinit(self.ptr, allocator);
     }
 };
 
@@ -142,6 +150,7 @@ pub const StdioTransport = struct {
                 .send = sendVtable,
                 .receive = receiveVtable,
                 .close = closeVtable,
+                .deinit = deinitVtable,
             },
         };
     }
@@ -159,6 +168,12 @@ pub const StdioTransport = struct {
     fn closeVtable(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.close();
+    }
+
+    fn deinitVtable(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.deinit(allocator);
+        allocator.destroy(self);
     }
 };
 
@@ -198,10 +213,10 @@ pub const HttpTransport = struct {
     }
 
     /// Sends a JSON-RPC message via HTTP POST.
-    pub fn send(self: *Self, _: std.Io, allocator: std.mem.Allocator, message: []const u8) Transport.SendError!void {
+    pub fn send(self: *Self, io: std.Io, allocator: std.mem.Allocator, message: []const u8) Transport.SendError!void {
         if (self.is_closed) return Transport.SendError.ConnectionClosed;
 
-        var client: std.http.Client = .{ .allocator = allocator };
+        var client: std.http.Client = .{ .allocator = allocator, .io = io };
         defer client.deinit();
 
         const uri = std.Uri.parse(self.endpoint) catch return Transport.SendError.WriteError;
@@ -237,9 +252,20 @@ pub const HttpTransport = struct {
             };
         }
 
+        // Do not follow redirects. This request carries a bearer token and a
+        // session id, and both are credentials for *this* endpoint. Following a
+        // `Location` would hand them to whatever host the response names.
+        //
+        // `privileged_headers` is not a way out: std stores it, asserts on it
+        // and clears it across domains, but never writes it to the wire, so
+        // putting credentials there drops them from every request instead.
+        // Refusing the redirect is the only fail-closed option, and an MCP
+        // client has a configured endpoint and no reason to be redirected off
+        // it anyway.
         var req = client.request(.POST, uri, .{
             .headers = .{ .user_agent = .{ .override = "mcp.zig" } },
             .extra_headers = extra_headers.items,
+            .redirect_behavior = .not_allowed,
         }) catch return Transport.SendError.WriteError;
         defer req.deinit();
 
@@ -366,6 +392,7 @@ pub const HttpTransport = struct {
                 .send = sendVtable,
                 .receive = receiveVtable,
                 .close = closeVtable,
+                .deinit = deinitVtable,
             },
         };
     }
@@ -383,6 +410,12 @@ pub const HttpTransport = struct {
     fn closeVtable(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.close();
+    }
+
+    fn deinitVtable(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.deinit(allocator);
+        allocator.destroy(self);
     }
 };
 
@@ -446,4 +479,221 @@ test "HttpTransport session ID" {
 
     try transport_impl.setSessionId(allocator, "test-session-123");
     try std.testing.expectEqualStrings("test-session-123", transport_impl.session_id.?);
+}
+
+/// A minimal HTTP origin used to exercise `HttpTransport` against a real
+/// socket. Serves one reply per connection and records the request head.
+const TestHttpOrigin = struct {
+    listener: *std.Io.net.Server,
+    replies: []const []const u8,
+    captured: [4][]u8 = @splat(&.{}),
+    captured_count: usize = 0,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *TestHttpOrigin) void {
+        for (self.captured[0..self.captured_count]) |c| self.allocator.free(c);
+    }
+
+    /// Connections that carried a real request, ignoring the sentinel used to
+    /// release a pending `accept`.
+    fn requestCount(self: *const TestHttpOrigin) usize {
+        var n: usize = 0;
+        for (self.captured[0..self.captured_count]) |c| {
+            if (std.mem.indexOf(u8, c, "HTTP/1.1") != null) n += 1;
+        }
+        return n;
+    }
+
+    fn run(self: *TestHttpOrigin) void {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        for (self.replies) |reply| {
+            var stream = self.listener.accept(io) catch return;
+            defer stream.close(io);
+
+            var recv_buffer: [4096]u8 = undefined;
+            var send_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(io, &recv_buffer);
+            var writer = stream.writer(io, &send_buffer);
+
+            // Only the head matters for these assertions.
+            var head: std.ArrayList(u8) = .empty;
+            defer head.deinit(self.allocator);
+            while (std.mem.indexOf(u8, head.items, "\r\n\r\n") == null) {
+                var byte: [1]u8 = undefined;
+                const n = reader.interface.readSliceShort(&byte) catch break;
+                if (n == 0) break;
+                head.append(self.allocator, byte[0]) catch break;
+            }
+
+            if (self.captured_count < self.captured.len) {
+                self.captured[self.captured_count] = self.allocator.dupe(u8, head.items) catch &.{};
+                self.captured_count += 1;
+            }
+
+            writer.interface.writeAll(reply) catch {};
+            writer.interface.flush() catch {};
+        }
+    }
+};
+
+/// Bind a loopback listener on the first free port at or above `base_port`.
+fn bindTestListener(io: std.Io, base_port: u16, out_port: *u16) !std.Io.net.Server {
+    var attempt: u16 = 0;
+    while (attempt < 40) : (attempt += 1) {
+        const port = base_port + attempt;
+        const address = std.Io.net.IpAddress.resolve(io, "127.0.0.1", port) catch continue;
+        const listener = std.Io.net.IpAddress.listen(&address, io, .{}) catch continue;
+        out_port.* = port;
+        return listener;
+    }
+    return error.NoFreePort;
+}
+
+test "HttpTransport sends credentials and records the issued session id" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try bindTestListener(io, 39100, &port);
+    defer listener.deinit(io);
+
+    const replies = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nmcp-session-id: issued-session\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}",
+    };
+    var origin: TestHttpOrigin = .{
+        .listener = &listener,
+        .replies = &replies,
+        .allocator = allocator,
+    };
+    defer origin.deinit();
+
+    const thread = try std.Thread.spawn(.{}, TestHttpOrigin.run, .{&origin});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(endpoint);
+
+    var transport_impl = try HttpTransport.init(allocator, endpoint);
+    defer transport_impl.deinit(allocator);
+    try transport_impl.setAuthorizationToken(allocator, "test-token");
+
+    try transport_impl.send(io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
+
+    try std.testing.expectEqual(@as(usize, 1), origin.captured_count);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "authorization: Bearer test-token") != null);
+
+    // The id the server issued must be recorded for subsequent requests.
+    try std.testing.expectEqualStrings("issued-session", transport_impl.session_id.?);
+}
+
+test "HttpTransport refuses to follow a redirect" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try bindTestListener(io, 39200, &port);
+    defer listener.deinit(io);
+
+    // A server that answers with a `Location` it controls would otherwise be
+    // handed the bearer token and the session id on the next hop.
+    var redirect_buf: [256]u8 = undefined;
+    const redirect_reply = try std.fmt.bufPrint(
+        &redirect_buf,
+        "HTTP/1.1 303 See Other\r\nLocation: http://localhost:{d}/steal\r\nContent-Length: 0\r\n\r\n",
+        .{port},
+    );
+    const replies = [_][]const u8{
+        redirect_reply,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}",
+    };
+    var origin: TestHttpOrigin = .{
+        .listener = &listener,
+        .replies = &replies,
+        .allocator = allocator,
+    };
+    defer origin.deinit();
+
+    const thread = try std.Thread.spawn(.{}, TestHttpOrigin.run, .{&origin});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(endpoint);
+
+    var transport_impl = try HttpTransport.init(allocator, endpoint);
+    defer transport_impl.deinit(allocator);
+    try transport_impl.setAuthorizationToken(allocator, "test-token");
+    try transport_impl.setSessionId(allocator, "secret-session");
+
+    try std.testing.expectError(
+        Transport.SendError.WriteError,
+        transport_impl.send(io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"),
+    );
+
+    // The origin is willing to serve a second hop, so a regression that starts
+    // following redirects again fails the assertion below instead of hanging
+    // here. Release the pending accept with a connection that sends nothing.
+    {
+        const sentinel_address = try std.Io.net.IpAddress.resolve(io, "127.0.0.1", port);
+        var sentinel = try std.Io.net.IpAddress.connect(&sentinel_address, io, .{ .mode = .stream });
+        sentinel.close(io);
+    }
+
+    // Exactly one hop: the redirect was never followed, so the credentials
+    // were never offered to the redirect target.
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "authorization:") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "mcp-session-id:") != null);
+
+    // Nothing was queued from a failed request.
+    try std.testing.expectEqual(@as(usize, 0), transport_impl.pending_responses.items.len);
+}
+
+test "Client.connectHttp round-trips and frees everything it allocates" {
+    // Exercises the whole client HTTP path under the testing allocator, which
+    // fails on any leak. Nothing else in the tree instantiates HttpTransport,
+    // and without a test like this Zig never analyses it at all.
+    const client_mod = @import("../client/client.zig");
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try bindTestListener(io, 39300, &port);
+    defer listener.deinit(io);
+
+    const init_result = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nmcp-session-id: issued-session\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}";
+    const replies = [_][]const u8{ init_result, init_result };
+    var origin: TestHttpOrigin = .{
+        .listener = &listener,
+        .replies = &replies,
+        .allocator = allocator,
+    };
+    defer origin.deinit();
+
+    const thread = try std.Thread.spawn(.{}, TestHttpOrigin.run, .{&origin});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(endpoint);
+
+    var client: client_mod.Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(allocator);
+
+    try client.connectHttp(io, allocator, endpoint);
+    try client.listTools(io, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), origin.requestCount());
+    // The handshake response carried a session id; the next request replays it.
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[1], "mcp-session-id: issued-session") != null);
 }

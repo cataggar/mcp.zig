@@ -58,9 +58,14 @@ const HttpRequestTransport = struct {
                 .send = sendVtable,
                 .receive = receiveVtable,
                 .close = closeVtable,
+                .deinit = deinitVtable,
             },
         };
     }
+
+    /// No-op: this transport lives on the connection handler's stack and is
+    /// cleaned up by its own `defer`, so nothing here owns a heap allocation.
+    fn deinitVtable(_: *anyopaque, _: std.mem.Allocator) void {}
 
     fn sendVtable(ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, message: []const u8) transport_mod.Transport.SendError!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
