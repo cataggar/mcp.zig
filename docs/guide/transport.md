@@ -68,6 +68,9 @@ try server.run(io, allocator, .{ .http = .{
 | `allow_non_loopback` | `false` | Required to bind any other address. |
 | `auth_token` | `null` | Bearer token required on every request. Mandatory for non-loopback binds; minimum 32 characters. |
 | `allowed_origins` | `&.{}` | Origins allowed to make browser-initiated requests. Empty rejects any request carrying `Origin`. |
+| `connection_timeout_s` | `30` | Read/write deadline per connection. `0` disables. |
+| `shutdown_grace_ms` | `5000` | How long `shutdown` waits for in-flight connections to drain. |
+| `reuse_address` | `true` | Sets `SO_REUSEADDR`, so a restart is not blocked by `TIME_WAIT`. |
 
 Session limits are fields on `Server` rather than on the run config:
 
@@ -92,6 +95,27 @@ interleave their mutations of that session's tasks, log level or handshake.
 A session that is being served is reference-counted, so a concurrent idle sweep
 or `DELETE` unpublishes it immediately — no new request can find it — but frees
 it only once the last in-flight request finishes.
+
+Every accepted connection gets a `connection_timeout_s` read and write deadline,
+so a client cannot hold a connection slot by dribbling out a request head. This
+is best effort: a platform that rejects the socket option leaves the connection
+without a deadline rather than refusing it.
+
+### Shutdown
+
+`Server.shutdown(io)` is safe to call from any thread:
+
+```zig
+server.shutdown(io); // e.g. from a signal handler thread
+```
+
+It marks the server as shutting down and shuts the listening socket down, which
+unblocks a parked `accept`. Without that, a server with no traffic could not be
+stopped at all, because the accept loop only re-checks state between
+connections. `runHttp` then waits up to `shutdown_grace_ms` for in-flight
+connections to finish before returning.
+
+Repeated accept failures back off from 1 ms to a cap of 1 s rather than spinning.
 
 When `auth_token` is set, every request must carry
 `Authorization: Bearer <token>`; anything else is answered with `401` before
