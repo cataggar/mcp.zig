@@ -76,6 +76,22 @@ Session limits are fields on `Server` rather than on the run config:
 | `max_sessions` | `256` | Concurrently tracked HTTP sessions. Further handshakes get `503`. |
 | `session_idle_timeout_s` | `300` | Idle seconds before a session is reclaimed. |
 | `max_tasks_per_session` | `256` | Tasks retained per session. |
+| `max_connections` | `64` | HTTP connections served on their own thread at once. |
+
+### Concurrency
+
+Each accepted HTTP connection is served on its own thread, so one slow client
+cannot stall the others behind it. Once `max_connections` connections are in
+flight the accept loop serves the next one inline rather than spawning without
+bound or refusing it, which caps thread growth while still making progress.
+
+Requests against the *same* session are serialized: the session is locked for
+the duration of a request, so two requests sharing an `Mcp-Session-Id` cannot
+interleave their mutations of that session's tasks, log level or handshake.
+
+A session that is being served is reference-counted, so a concurrent idle sweep
+or `DELETE` unpublishes it immediately — no new request can find it — but frees
+it only once the last in-flight request finishes.
 
 When `auth_token` is set, every request must carry
 `Authorization: Bearer <token>`; anything else is answered with `401` before

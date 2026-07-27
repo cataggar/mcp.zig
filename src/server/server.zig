@@ -130,6 +130,25 @@ const TaskEntry = struct {
 /// `Server` keeps only immutable registrations (tools/resources/prompts) and
 /// the session table.
 pub const Session = struct {
+    /// Where replies for the request currently being served go.
+    ///
+    /// This is per-request state, not per-session: the HTTP transport builds a
+    /// fresh reply sink for every request. It lives here rather than on
+    /// `Server` because `Server` is shared by every connection, and a second
+    /// connection would overwrite the first one's reply sink mid-request.
+    /// `mutex` is held for the whole of a request, so concurrent requests on
+    /// one session are serialized rather than interleaved.
+    reply: ?transport_mod.Transport = null,
+    /// Held for the duration of a request against this session.
+    mutex: std.Io.Mutex = .init,
+    /// Number of connections currently serving this session. Guarded by
+    /// `Server.sessions_mutex`. A session with live references is never freed,
+    /// so a concurrent idle sweep or `DELETE` cannot pull it out from under a
+    /// request in flight.
+    refs: usize = 0,
+    /// Set when the session has been terminated but still has live references.
+    /// The last reference to be released performs the teardown.
+    closing: bool = false,
     /// Session identifier handed to the client as `Mcp-Session-Id`.
     /// `null` for the implicit session used by stdio and custom transports,
     /// which are single-client by construction.
@@ -198,6 +217,17 @@ pub const Server = struct {
     session_idle_timeout_s: i64 = 5 * 60,
     /// Maximum number of tasks retained per session.
     max_tasks_per_session: usize = 256,
+    /// Guards `sessions`. Connections are served concurrently, so the table is
+    /// reachable from several threads at once.
+    sessions_mutex: std.Io.Mutex = .init,
+    /// Guards `active_connections`.
+    connections_mutex: std.Io.Mutex = .init,
+    /// HTTP connections currently being served.
+    active_connections: usize = 0,
+    /// Upper bound on concurrently served HTTP connections. Beyond this,
+    /// accepted connections wait for a slot rather than spawning unbounded
+    /// threads.
+    max_connections: usize = 64,
     pub const max_http_body_size: usize = 4 * 1024 * 1024;
 
     const Self = @This();
@@ -267,6 +297,8 @@ pub const Server = struct {
 
     /// Mint an unregistered session with a fresh CSPRNG identifier.
     fn createSession(self: *Self, io: std.Io) !CreatedSession {
+        self.sessions_mutex.lock(io) catch return error.Canceled;
+        defer self.sessions_mutex.unlock(io);
         self.sweepIdleSessions(io);
         if (self.sessions.count() >= self.max_sessions) return error.TooManySessions;
 
@@ -294,9 +326,32 @@ pub const Server = struct {
     }
 
     /// Look up a registered session by the id a client presented.
+    ///
+    /// Callers must hold `sessions_mutex` when other threads may be running.
     fn lookupSession(self: *Self, presented_id: []const u8) ?*Session {
         var key_buf: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
         return self.sessions.get(sessionKey(presented_id, &key_buf));
+    }
+
+    /// Look up a session and pin it so it survives for the caller's request.
+    ///
+    /// Every successful call must be paired with `releaseSession`.
+    fn acquireSession(self: *Self, io: std.Io, presented_id: []const u8) ?*Session {
+        self.sessions_mutex.lock(io) catch return null;
+        defer self.sessions_mutex.unlock(io);
+        const session = self.lookupSession(presented_id) orelse return null;
+        if (session.closing) return null;
+        session.refs += 1;
+        return session;
+    }
+
+    /// Drop a reference taken by `acquireSession`, tearing the session down if
+    /// it was terminated while this reference was held.
+    fn releaseSession(self: *Self, io: std.Io, session: *Session) void {
+        self.sessions_mutex.lock(io) catch return;
+        defer self.sessions_mutex.unlock(io);
+        session.refs -= 1;
+        if (session.closing and session.refs == 0) self.destroySession(session);
     }
 
     /// Tear a session down, removing it from the table if it was registered.
@@ -314,11 +369,21 @@ pub const Server = struct {
         defer expired.deinit(self.allocator);
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
+            if (entry.value_ptr.*.closing) continue;
             if (now -| entry.value_ptr.*.last_seen_s > self.session_idle_timeout_s) {
                 expired.append(self.allocator, entry.value_ptr.*) catch return;
             }
         }
-        for (expired.items) |session| self.destroySession(session);
+        for (expired.items) |session| {
+            // A session being served right now is left alone; the connection
+            // holding it performs the teardown when it finishes.
+            if (session.refs > 0) {
+                session.closing = true;
+                _ = self.sessions.remove(session.id.?);
+                continue;
+            }
+            self.destroySession(session);
+        }
     }
 
     /// Add a tool to the server
@@ -499,10 +564,76 @@ pub const Server = struct {
                 continue;
             };
 
+            // Serve on its own thread so one slow client cannot stall every
+            // other client behind it. At capacity we serve inline instead of
+            // spawning without bound or dropping the connection.
+            if (self.tryAcquireConnectionSlot(io)) {
+                if (self.spawnConnection(io, allocator, stream, config)) continue;
+                self.releaseConnectionSlot(io);
+            }
+
             self.serveHttpConnection(io, allocator, stream, config) catch |err| {
                 std.log.err("HTTP connection error: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    const ConnectionContext = struct {
+        server: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        stream: std.Io.net.Stream,
+        config: HttpRunConfig,
+    };
+
+    /// Take a connection slot if the server is below `max_connections`.
+    fn tryAcquireConnectionSlot(self: *Self, io: std.Io) bool {
+        self.connections_mutex.lock(io) catch return false;
+        defer self.connections_mutex.unlock(io);
+        if (self.active_connections >= self.max_connections) return false;
+        self.active_connections += 1;
+        return true;
+    }
+
+    fn releaseConnectionSlot(self: *Self, io: std.Io) void {
+        self.connections_mutex.lock(io) catch return;
+        defer self.connections_mutex.unlock(io);
+        self.active_connections -= 1;
+    }
+
+    /// Hand a connection to a worker thread. Returns false if it could not be
+    /// spawned, in which case the caller still owns the connection.
+    fn spawnConnection(
+        self: *Self,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        stream: std.Io.net.Stream,
+        config: HttpRunConfig,
+    ) bool {
+        const ctx = allocator.create(ConnectionContext) catch return false;
+        ctx.* = .{
+            .server = self,
+            .io = io,
+            .allocator = allocator,
+            .stream = stream,
+            .config = config,
+        };
+        const thread = std.Thread.spawn(.{}, connectionWorker, .{ctx}) catch {
+            allocator.destroy(ctx);
+            return false;
+        };
+        thread.detach();
+        return true;
+    }
+
+    fn connectionWorker(ctx: *ConnectionContext) void {
+        defer {
+            ctx.server.releaseConnectionSlot(ctx.io);
+            ctx.allocator.destroy(ctx);
+        }
+        ctx.server.serveHttpConnection(ctx.io, ctx.allocator, ctx.stream, ctx.config) catch |err| {
+            std.log.err("HTTP connection error: {s}", .{@errorName(err)});
+        };
     }
 
     fn serveHttpConnection(self: *Self, io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, config: HttpRunConfig) !void {
@@ -574,7 +705,7 @@ pub const Server = struct {
         }
 
         if (request.head.method == .DELETE) {
-            try self.handleHttpSessionDelete(&request);
+            try self.handleHttpSessionDelete(io, &request);
             return;
         }
 
@@ -585,12 +716,23 @@ pub const Server = struct {
     ///
     /// Without this a client has no way to release its state early and the
     /// table only drains on the idle sweep.
-    fn handleHttpSessionDelete(self: *Self, request: *http.Server.Request) !void {
+    fn handleHttpSessionDelete(self: *Self, io: std.Io, request: *http.Server.Request) !void {
         var header_it = http.HeaderIterator.init(request.head_buffer);
         while (header_it.next()) |header| {
             if (!std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) continue;
-            const session = self.lookupSession(header.value) orelse break;
-            self.destroySession(session);
+            self.sessions_mutex.lock(io) catch return error.Canceled;
+            const session = self.lookupSession(header.value) orelse {
+                self.sessions_mutex.unlock(io);
+                break;
+            };
+            if (session.refs > 0) {
+                // Still in use: unpublish now, tear down on last release.
+                session.closing = true;
+                _ = self.sessions.remove(session.id.?);
+            } else {
+                self.destroySession(session);
+            }
+            self.sessions_mutex.unlock(io);
             try request.respond("", .{ .status = .no_content });
             return;
         }
@@ -691,8 +833,12 @@ pub const Server = struct {
             }
         }
         var session: *Session = undefined;
+        // Pinned for the rest of the request so a concurrent idle sweep or
+        // `DELETE` cannot free it while this connection is still using it.
+        var acquired: ?*Session = null;
+        defer if (acquired) |a| self.releaseSession(io, a);
         if (provided_session_id) |sid| {
-            session = self.lookupSession(sid) orelse {
+            session = self.acquireSession(io, sid) orelse {
                 try request.respond("Unknown or expired MCP session", .{
                     .status = .not_found,
                     .extra_headers = &.{
@@ -701,6 +847,7 @@ pub const Server = struct {
                 });
                 return;
             };
+            acquired = session;
             session.last_seen_s = nowSeconds(io);
         }
 
@@ -796,9 +943,14 @@ pub const Server = struct {
         var request_transport: HttpRequestTransport = .{ .owner_allocator = allocator };
         defer request_transport.deinit();
 
-        const previous_transport = self.transport;
-        self.transport = request_transport.transport();
-        defer self.transport = previous_transport;
+        // The reply sink is per-request state, so it hangs off the session
+        // being served rather than off `Server`, which every connection shares.
+        // The session mutex is held for the whole exchange so two concurrent
+        // requests on one session cannot overwrite each other's sink.
+        session.mutex.lock(io) catch return error.Canceled;
+        defer session.mutex.unlock(io);
+        session.reply = request_transport.transport();
+        defer session.reply = null;
 
         self.handleMessage(session, io, allocator, body_items) catch {
             const internal_error = jsonrpc.createParseError(.{ .string = "Internal server error" });
@@ -828,6 +980,8 @@ pub const Server = struct {
         var emit_session_id: ?[]const u8 = null;
         if (provisional) |p| {
             if (p.state != .uninitialized) {
+                self.sessions_mutex.lock(io) catch return error.Canceled;
+                defer self.sessions_mutex.unlock(io);
                 try self.sessions.put(p.id.?, p);
                 keep_provisional = true;
                 emit_session_id = provisional_plaintext_id.?;
@@ -915,7 +1069,7 @@ pub const Server = struct {
 
         const parsed_message = jsonrpc.parseMessage(aa, data) catch {
             const error_response = jsonrpc.createParseError(null);
-            try self.sendResponse(io, aa, .{ .error_response = error_response });
+            try self.sendResponse(session, io, aa, .{ .error_response = error_response });
             return;
         };
 
@@ -941,36 +1095,36 @@ pub const Server = struct {
                 "Server not initialized",
                 null,
             );
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
             return;
         }
 
         if (std.mem.eql(u8, request.method, "initialize")) {
             try self.handleInitialize(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "ping")) {
-            try self.handlePing(io, allocator, request);
+            try self.handlePing(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tools/list")) {
-            try self.handleToolsList(io, allocator, request);
+            try self.handleToolsList(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tools/call")) {
             try self.handleToolsCall(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/list")) {
-            try self.handleResourcesList(io, allocator, request);
+            try self.handleResourcesList(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/read")) {
-            try self.handleResourcesRead(io, allocator, request);
+            try self.handleResourcesRead(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/templates/list")) {
-            try self.handleResourceTemplatesList(io, allocator, request);
+            try self.handleResourceTemplatesList(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/subscribe")) {
-            try self.handleSubscribe(io, allocator, request);
+            try self.handleSubscribe(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/unsubscribe")) {
-            try self.handleUnsubscribe(io, allocator, request);
+            try self.handleUnsubscribe(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "prompts/list")) {
-            try self.handlePromptsList(io, allocator, request);
+            try self.handlePromptsList(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "prompts/get")) {
-            try self.handlePromptsGet(io, allocator, request);
+            try self.handlePromptsGet(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "logging/setLevel")) {
             try self.handleSetLogLevel(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "completion/complete")) {
-            try self.handleCompletion(io, allocator, request);
+            try self.handleCompletion(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tasks/get")) {
             try self.handleTasksGet(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tasks/result")) {
@@ -981,7 +1135,7 @@ pub const Server = struct {
             try self.handleTasksCancel(session, io, allocator, request);
         } else {
             const error_response = jsonrpc.createMethodNotFound(request.id, request.method);
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
         }
     }
 
@@ -1091,20 +1245,20 @@ pub const Server = struct {
         }
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle ping request
-    fn handlePing(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handlePing(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var result: std.json.ObjectMap = .empty;
         defer result.deinit(allocator);
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle tools/list request
-    fn handleToolsList(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleToolsList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var tools_array: std.json.Array = .init(allocator);
 
         var iter = self.tools.iterator();
@@ -1177,7 +1331,7 @@ pub const Server = struct {
         try result.put(allocator, "tools", .{ .array = tools_array });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle tools/call request
@@ -1214,14 +1368,14 @@ pub const Server = struct {
 
             if (tasks_enabled and task_support != null and std.mem.eql(u8, task_support.?, "required") and task_meta == null) {
                 const error_response = jsonrpc.createMethodNotFound(request.id, "tools/call");
-                try self.sendResponse(io, allocator, .{ .error_response = error_response });
+                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
                 return;
             }
 
             if (tasks_enabled and task_meta != null) {
                 if (task_support == null or std.mem.eql(u8, task_support.?, "forbidden")) {
                     const error_response = jsonrpc.createMethodNotFound(request.id, "tools/call");
-                    try self.sendResponse(io, allocator, .{ .error_response = error_response });
+                    try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
                     return;
                 }
 
@@ -1233,7 +1387,7 @@ pub const Server = struct {
                         "Task limit reached for this session",
                         null,
                     );
-                    try self.sendResponse(io, allocator, .{ .error_response = error_response });
+                    try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
                     return;
                 }
                 const tool_result: tools_mod.ToolResult = tool.handler(tool.user_data, io, allocator, arguments) catch |err| blk: {
@@ -1266,7 +1420,7 @@ pub const Server = struct {
                 try result.put(allocator, "task", .{ .object = task_obj });
 
                 const response = jsonrpc.createResponse(request.id, .{ .object = result });
-                try self.sendResponse(io, allocator, .{ .response = response });
+                try self.sendResponse(session, io, allocator, .{ .response = response });
                 return;
             }
 
@@ -1275,21 +1429,21 @@ pub const Server = struct {
                 content[0] = .{ .text = .{ .text = @errorName(err) } };
                 const result_value = try buildToolCallResultValue(allocator, .{ .content = content, .is_error = true });
                 const response = jsonrpc.createResponse(request.id, result_value);
-                try self.sendResponse(io, allocator, .{ .response = response });
+                try self.sendResponse(session, io, allocator, .{ .response = response });
                 return;
             };
 
             const result_value = try buildToolCallResultValue(allocator, tool_result);
             const response = jsonrpc.createResponse(request.id, result_value);
-            try self.sendResponse(io, allocator, .{ .response = response });
+            try self.sendResponse(session, io, allocator, .{ .response = response });
         } else {
             const error_response = jsonrpc.createInvalidParams(request.id, "Tool not found");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
         }
     }
 
     /// Handle resources/list request
-    fn handleResourcesList(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleResourcesList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var resources_array: std.json.Array = .init(allocator);
 
         var iter = self.resources.iterator();
@@ -1325,11 +1479,11 @@ pub const Server = struct {
         try result.put(allocator, "resources", .{ .array = resources_array });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle resources/read request
-    fn handleResourcesRead(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleResourcesRead(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var uri: []const u8 = "";
 
         if (request.params) |params| {
@@ -1345,7 +1499,7 @@ pub const Server = struct {
         if (self.resources.get(uri)) |resource| {
             const content = resource.handler(resource.user_data, io, allocator, uri) catch |err| {
                 const error_response = jsonrpc.createInternalError(request.id, .{ .string = @errorName(err) });
-                try self.sendResponse(io, allocator, .{ .error_response = error_response });
+                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
                 return;
             };
 
@@ -1370,15 +1524,15 @@ pub const Server = struct {
             try result.put(allocator, "contents", .{ .array = contents_array });
 
             const response = jsonrpc.createResponse(request.id, .{ .object = result });
-            try self.sendResponse(io, allocator, .{ .response = response });
+            try self.sendResponse(session, io, allocator, .{ .response = response });
         } else {
             const error_response = jsonrpc.createInvalidParams(request.id, "Resource not found");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
         }
     }
 
     /// Handle resources/templates/list request
-    fn handleResourceTemplatesList(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleResourceTemplatesList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var templates_array: std.json.Array = .init(allocator);
 
         var iter = self.resource_templates.iterator();
@@ -1411,29 +1565,29 @@ pub const Server = struct {
         try result.put(allocator, "resourceTemplates", .{ .array = templates_array });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle resources/subscribe request
-    fn handleSubscribe(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleSubscribe(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         _ = request.params;
         var result: std.json.ObjectMap = .empty;
         defer result.deinit(allocator);
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle resources/unsubscribe request
-    fn handleUnsubscribe(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleUnsubscribe(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         _ = request.params;
         var result: std.json.ObjectMap = .empty;
         defer result.deinit(allocator);
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle prompts/list request
-    fn handlePromptsList(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handlePromptsList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var prompts_array: std.json.Array = .init(allocator);
 
         var iter = self.prompts.iterator();
@@ -1478,11 +1632,11 @@ pub const Server = struct {
         try result.put(allocator, "prompts", .{ .array = prompts_array });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle prompts/get request
-    fn handlePromptsGet(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handlePromptsGet(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var prompt_name: []const u8 = "";
         var arguments: ?std.json.Value = null;
 
@@ -1500,7 +1654,7 @@ pub const Server = struct {
         if (self.prompts.get(prompt_name)) |prompt| {
             const messages = prompt.handler(prompt.user_data, io, allocator, arguments) catch |err| {
                 const error_response = jsonrpc.createInternalError(request.id, .{ .string = @errorName(err) });
-                try self.sendResponse(io, allocator, .{ .error_response = error_response });
+                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
                 return;
             };
 
@@ -1548,10 +1702,10 @@ pub const Server = struct {
             }
 
             const response = jsonrpc.createResponse(request.id, .{ .object = result });
-            try self.sendResponse(io, allocator, .{ .response = response });
+            try self.sendResponse(session, io, allocator, .{ .response = response });
         } else {
             const error_response = jsonrpc.createInvalidParams(request.id, "Prompt not found");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
         }
     }
 
@@ -1586,11 +1740,11 @@ pub const Server = struct {
 
         const result: std.json.ObjectMap = .empty;
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle completion/complete request
-    fn handleCompletion(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleCompletion(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var completion: std.json.ObjectMap = .empty;
         const values_array: std.json.Array = .init(allocator);
         try completion.put(allocator, "values", .{ .array = values_array });
@@ -1600,7 +1754,7 @@ pub const Server = struct {
         try result.put(allocator, "completion", .{ .object = completion });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle tasks/get request
@@ -1618,17 +1772,17 @@ pub const Server = struct {
 
         const id = task_id orelse {
             const error_response = jsonrpc.createInvalidParams(request.id, "Missing taskId");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
             return;
         };
 
         if (session.tasks.get(id)) |entry| {
             const task_obj = try buildTaskObject(allocator, entry.task);
             const response = jsonrpc.createResponse(request.id, .{ .object = task_obj });
-            try self.sendResponse(io, allocator, .{ .response = response });
+            try self.sendResponse(session, io, allocator, .{ .response = response });
         } else {
             const error_response = jsonrpc.createInvalidParams(request.id, "Task not found");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
         }
     }
 
@@ -1647,7 +1801,7 @@ pub const Server = struct {
 
         const id = task_id orelse {
             const error_response = jsonrpc.createInvalidParams(request.id, "Missing taskId");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
             return;
         };
 
@@ -1665,15 +1819,15 @@ pub const Server = struct {
                     try result_obj.put(allocator, "_meta", .{ .object = meta_obj });
                 }
                 const response = jsonrpc.createResponse(request.id, .{ .object = result_obj });
-                try self.sendResponse(io, allocator, .{ .response = response });
+                try self.sendResponse(session, io, allocator, .{ .response = response });
                 return;
             }
 
             const error_response = jsonrpc.createInternalError(request.id, .{ .string = "Invalid task result" });
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
         } else {
             const error_response = jsonrpc.createInvalidParams(request.id, "Task not found");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
         }
     }
 
@@ -1690,7 +1844,7 @@ pub const Server = struct {
         try result.put(allocator, "tasks", .{ .array = tasks_array });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
-        try self.sendResponse(io, allocator, .{ .response = response });
+        try self.sendResponse(session, io, allocator, .{ .response = response });
     }
 
     /// Handle tasks/cancel request
@@ -1708,14 +1862,14 @@ pub const Server = struct {
 
         const id = task_id orelse {
             const error_response = jsonrpc.createInvalidParams(request.id, "Missing taskId");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
             return;
         };
 
         if (session.tasks.getPtr(id)) |entry| {
             if (entry.task.status == .completed or entry.task.status == .failed or entry.task.status == .cancelled) {
                 const error_response = jsonrpc.createInvalidParams(request.id, "Task already in terminal status");
-                try self.sendResponse(io, allocator, .{ .error_response = error_response });
+                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
                 return;
             }
 
@@ -1726,10 +1880,10 @@ pub const Server = struct {
 
             const task_obj = try buildTaskObject(allocator, entry.task);
             const response = jsonrpc.createResponse(request.id, .{ .object = task_obj });
-            try self.sendResponse(io, allocator, .{ .response = response });
+            try self.sendResponse(session, io, allocator, .{ .response = response });
         } else {
             const error_response = jsonrpc.createInvalidParams(request.id, "Task not found");
-            try self.sendResponse(io, allocator, .{ .error_response = error_response });
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
         }
     }
 
@@ -1775,7 +1929,11 @@ pub const Server = struct {
     /// Send a notification to the client
     pub fn sendNotification(self: *Self, io: std.Io, allocator: std.mem.Allocator, method: []const u8, params: ?std.json.Value) !void {
         const notification = jsonrpc.createNotification(method, params);
-        try self.sendResponse(io, allocator, .{ .notification = notification });
+        // Server-initiated notifications are not a reply to any request, so
+        // they go to the server-wide transport. Over HTTP that means stdio-style
+        // single-transport deployments only; per-session push needs the GET
+        // stream, which is not implemented yet.
+        try self.sendVia(self.transport, io, allocator, .{ .notification = notification });
     }
 
     /// Send a log message notification
@@ -1825,9 +1983,16 @@ pub const Server = struct {
         try self.sendNotification(io, allocator, "notifications/prompts/list_changed", null);
     }
 
-    /// Send a response message
-    fn sendResponse(self: *Self, io: std.Io, allocator: std.mem.Allocator, message: jsonrpc.Message) !void {
-        if (self.transport) |t| {
+    /// Send a response message back to the session that made the request.
+    fn sendResponse(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, message: jsonrpc.Message) !void {
+        // `session.reply` is set by the HTTP path per request; stdio and
+        // custom transports have a single server-wide transport instead.
+        return self.sendVia(session.reply orelse self.transport, io, allocator, message);
+    }
+
+    /// Serialize and write a message to an explicit transport.
+    fn sendVia(self: *Self, dest: ?transport_mod.Transport, io: std.Io, allocator: std.mem.Allocator, message: jsonrpc.Message) !void {
+        if (dest) |t| {
             const json = jsonrpc.serializeMessage(allocator, message) catch {
                 self.logError(io, "Failed to serialize response");
                 return;
@@ -2296,9 +2461,9 @@ fn testRoundTrip(server: *Server, session: *Session, io: std.Io, message: []cons
     var request_transport: HttpRequestTransport = .{ .owner_allocator = std.testing.allocator };
     defer request_transport.deinit();
 
-    const previous_transport = server.transport;
-    server.transport = request_transport.transport();
-    defer server.transport = previous_transport;
+    const previous_reply = session.reply;
+    session.reply = request_transport.transport();
+    defer session.reply = previous_reply;
 
     try server.handleMessage(session, io, std.testing.allocator, message);
     const response = request_transport.response_message orelse return error.NoResponseProduced;
@@ -2529,4 +2694,106 @@ test "an unregistered provisional session is freed cleanly" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), server.sessions.count());
+}
+
+test "a response goes to the requesting session's reply sink" {
+    // Regression: the HTTP path used to stash the per-request reply sink on the
+    // shared `Server.transport`. Two connections in flight at once clobbered
+    // each other, so one client could receive another client's response.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const a = try testRegisterSession(&server, io);
+    const b = try testRegisterSession(&server, io);
+
+    var sink_a: HttpRequestTransport = .{ .owner_allocator = std.testing.allocator };
+    defer sink_a.deinit();
+    var sink_b: HttpRequestTransport = .{ .owner_allocator = std.testing.allocator };
+    defer sink_b.deinit();
+
+    // Both connections are mid-request, B having arrived second.
+    a.reply = sink_a.transport();
+    b.reply = sink_b.transport();
+
+    try server.handleMessage(a, io, std.testing.allocator, test_initialize_message);
+
+    try std.testing.expect(sink_a.response_message != null);
+    try std.testing.expect(sink_b.response_message == null);
+}
+
+test "an idle sweep does not free a session that is currently being served" {
+    // Regression: sessions were freed out from under in-flight requests, so a
+    // sweep or a `DELETE` on one connection was a use-after-free on another.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const created = try server.createSession(io);
+    defer std.testing.allocator.free(created.plaintext_id);
+    try server.sessions.put(created.session.id.?, created.session);
+
+    const session = server.acquireSession(io, created.plaintext_id).?;
+    try std.testing.expectEqual(@as(usize, 1), session.refs);
+
+    session.last_seen_s = 0;
+    server.sweepIdleSessions(io);
+
+    // Unpublished so no new request can find it, but not yet freed.
+    try std.testing.expect(session.closing);
+    try std.testing.expect(server.acquireSession(io, created.plaintext_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), server.sessions.count());
+
+    // The last reference performs the teardown; the leak check proves it.
+    server.releaseSession(io, session);
+}
+
+test "acquireSession pins a session against a concurrent DELETE" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const created = try server.createSession(io);
+    defer std.testing.allocator.free(created.plaintext_id);
+    try server.sessions.put(created.session.id.?, created.session);
+
+    const session = server.acquireSession(io, created.plaintext_id).?;
+
+    // What `handleHttpSessionDelete` does when the session is still referenced.
+    server.sessions_mutex.lock(io) catch unreachable;
+    session.closing = true;
+    _ = server.sessions.remove(session.id.?);
+    server.sessions_mutex.unlock(io);
+
+    // Still usable by the connection holding it.
+    try std.testing.expectEqual(@as(usize, 1), session.refs);
+    server.releaseSession(io, session);
+}
+
+test "connection slots are bounded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+    server.max_connections = 2;
+
+    try std.testing.expect(server.tryAcquireConnectionSlot(io));
+    try std.testing.expect(server.tryAcquireConnectionSlot(io));
+    try std.testing.expect(!server.tryAcquireConnectionSlot(io));
+
+    server.releaseConnectionSlot(io);
+    try std.testing.expect(server.tryAcquireConnectionSlot(io));
+    server.releaseConnectionSlot(io);
+    server.releaseConnectionSlot(io);
 }
