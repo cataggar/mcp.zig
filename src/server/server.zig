@@ -105,6 +105,19 @@ pub const ServerConfig = struct {
     /// `0` (the default) returns everything in a single page and never emits
     /// `nextCursor`, which is the historical behaviour.
     page_size: usize = 0,
+    /// Protocol versions this server will speak, newest first.
+    ///
+    /// `null` (the default) means `protocol.SUPPORTED_VERSIONS`. A host that
+    /// must not be talked to over an older revision can pin exactly one, which
+    /// only takes effect together with `strict_protocol_version`.
+    supported_protocol_versions: ?[]const []const u8 = null,
+    /// How to answer a client asking for a version this server does not speak.
+    ///
+    /// `false` (the default) follows the spec: negotiate down by replying with
+    /// the newest version this server supports and let the client decide
+    /// whether to continue. `true` fails the handshake with `-32602` instead,
+    /// for a host whose behaviour is only defined on the pinned revision.
+    strict_protocol_version: bool = false,
 };
 
 /// One page of a `*/list` response.
@@ -576,9 +589,42 @@ pub const Server = struct {
         try out.appendSlice(allocator, "\n");
     }
 
+    /// The `protocolVersion` a client asked for in `initialize`, if any.
+    fn requestedProtocolVersion(request: jsonrpc.Request) ?[]const u8 {
+        const params = request.params orelse return null;
+        if (params != .object) return null;
+        const value = params.object.get("protocolVersion") orelse return null;
+        if (value != .string) return null;
+        return value.string;
+    }
+
+    /// A human-readable list of the versions this server speaks, for the
+    /// `data` member of a version-mismatch error.
+    fn describeSupportedVersions(self: *const Self, allocator: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, "supported: ");
+        for (self.supportedProtocolVersions(), 0..) |version, i| {
+            if (i != 0) try out.appendSlice(allocator, ", ");
+            try out.appendSlice(allocator, version);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Protocol versions this server speaks, newest first.
+    pub fn supportedProtocolVersions(self: *const Self) []const []const u8 {
+        return self.config.supported_protocol_versions orelse &protocol.SUPPORTED_VERSIONS;
+    }
+
+    /// The version this server prefers, used when negotiating down.
+    fn preferredProtocolVersion(self: *const Self) []const u8 {
+        const versions = self.supportedProtocolVersions();
+        return if (versions.len == 0) protocol.VERSION else versions[0];
+    }
+
     /// Whether a client-presented `MCP-Protocol-Version` is one we speak.
-    fn isSupportedProtocolVersion(version: []const u8) bool {
-        for (protocol.SUPPORTED_VERSIONS) |supported| {
+    fn isSupportedProtocolVersion(self: *const Self, version: []const u8) bool {
+        for (self.supportedProtocolVersions()) |supported| {
             if (std.mem.eql(u8, supported, version)) return true;
         }
         return false;
@@ -1394,8 +1440,8 @@ pub const Server = struct {
         // read as 2025-03-26. Present but unsupported is a client error: a
         // client could otherwise negotiate one version at `initialize` and then
         // speak whatever it liked.
-        const negotiated_version = protocol_version orelse protocol.SUPPORTED_VERSIONS[2];
-        if (protocol_version != null and !isSupportedProtocolVersion(negotiated_version)) {
+        const negotiated_version = protocol_version orelse protocol.ASSUMED_VERSION_WITHOUT_HEADER;
+        if (!self.isSupportedProtocolVersion(negotiated_version)) {
             try request.respond("Unsupported MCP-Protocol-Version", .{
                 .status = .bad_request,
                 .extra_headers = &.{
@@ -1867,20 +1913,23 @@ pub const Server = struct {
             }
         }
 
-        // use client's requested version if supported
-        var negotiated_version: []const u8 = protocol.VERSION;
-        if (request.params) |params| {
-            if (params == .object) {
-                if (params.object.get("protocolVersion")) |pv| {
-                    if (pv == .string) {
-                        for (protocol.SUPPORTED_VERSIONS) |sv| {
-                            if (std.mem.eql(u8, pv.string, sv)) {
-                                negotiated_version = sv;
-                                break;
-                            }
-                        }
-                    }
-                }
+        // Reply with the client's version when we speak it, otherwise with our
+        // own newest so the client can decide whether to continue — unless the
+        // host pinned a version, in which case a mismatch is fatal.
+        var negotiated_version: []const u8 = self.preferredProtocolVersion();
+        if (requestedProtocolVersion(request)) |requested| {
+            if (self.isSupportedProtocolVersion(requested)) {
+                negotiated_version = requested;
+            } else if (self.config.strict_protocol_version) {
+                const detail = try self.describeSupportedVersions(allocator);
+                const error_response = jsonrpc.createErrorResponse(
+                    request.id,
+                    jsonrpc.ErrorCode.INVALID_PARAMS,
+                    "Unsupported protocol version",
+                    .{ .string = detail },
+                );
+                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+                return;
             }
         }
 
@@ -3601,11 +3650,28 @@ test "connection timeouts are applied to accepted sockets" {
 }
 
 test "MCP-Protocol-Version is validated against the supported set" {
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
     for (protocol.SUPPORTED_VERSIONS) |version| {
-        try std.testing.expect(Server.isSupportedProtocolVersion(version));
+        try std.testing.expect(server.isSupportedProtocolVersion(version));
     }
-    try std.testing.expect(!Server.isSupportedProtocolVersion("2199-01-01"));
-    try std.testing.expect(!Server.isSupportedProtocolVersion(""));
+    try std.testing.expect(!server.isSupportedProtocolVersion("2199-01-01"));
+    try std.testing.expect(!server.isSupportedProtocolVersion(""));
+}
+
+test "a pinned server validates MCP-Protocol-Version against only its own set" {
+    var server: Server = .init(std.testing.allocator, .{
+        .name = "t",
+        .version = "1",
+        .supported_protocol_versions = &.{"2025-11-25"},
+    });
+    defer server.deinit();
+
+    try std.testing.expect(server.isSupportedProtocolVersion("2025-11-25"));
+    // Otherwise supported library-wide, but not by this server.
+    try std.testing.expect(!server.isSupportedProtocolVersion("2025-06-18"));
+    try std.testing.expect(!server.isSupportedProtocolVersion(protocol.ASSUMED_VERSION_WITHOUT_HEADER));
 }
 
 test "a terminated session id is remembered so it can be answered 410" {
@@ -4081,4 +4147,80 @@ test "the in-flight table is bounded" {
     const body = reply.response() orelse return error.NoResponse;
     try std.testing.expect(std.mem.indexOf(u8, body, "-32603") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "Too many requests in flight") != null);
+}
+
+fn testHandshake(server: *Server, io: std.Io, requested: []const u8) !Server.Reply {
+    const message = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"c\",\"version\":\"1\"}}}}}}",
+        .{requested},
+    );
+    defer std.testing.allocator.free(message);
+    return server.handleMessageAlloc(io, std.testing.allocator, message);
+}
+
+test "by default an unknown protocol version negotiates down instead of failing" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const reply = try testHandshake(&server, io, "2019-01-01");
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    // The spec says to answer with the newest version we speak and let the
+    // client decide, not to reject the handshake.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"protocolVersion\":\"2025-11-25\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"error\"") == null);
+}
+
+test "a pinned strict server rejects any other protocol version" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{
+        .name = "t",
+        .version = "1",
+        .supported_protocol_versions = &.{"2025-11-25"},
+        .strict_protocol_version = true,
+    });
+    defer server.deinit();
+
+    const rejected = try testHandshake(&server, io, "2025-06-18");
+    defer rejected.deinit();
+    const rejected_body = rejected.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, rejected_body, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_body, "Unsupported protocol version") != null);
+    // The error says what would work.
+    try std.testing.expect(std.mem.indexOf(u8, rejected_body, "supported: 2025-11-25") != null);
+
+    const accepted = try testHandshake(&server, io, "2025-11-25");
+    defer accepted.deinit();
+    const accepted_body = accepted.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, accepted_body, "\"protocolVersion\":\"2025-11-25\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_body, "\"error\"") == null);
+}
+
+test "pinning without strict mode still negotiates down" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{
+        .name = "t",
+        .version = "1",
+        .supported_protocol_versions = &.{"2025-06-18"},
+    });
+    defer server.deinit();
+
+    const reply = try testHandshake(&server, io, "2025-11-25");
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    // The pinned set is what we advertise, even though the library knows a
+    // newer revision.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"protocolVersion\":\"2025-06-18\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"error\"") == null);
 }
