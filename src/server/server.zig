@@ -259,6 +259,14 @@ pub const Session = struct {
     tasks: std.StringHashMap(TaskEntry),
     pending_requests: std.AutoHashMap(i64, PendingRequest),
     next_request_id: i64 = 1,
+    /// Ids of client requests currently being served, so a repeat can be
+    /// rejected while the original is still outstanding. Keys are owned and
+    /// dropped as soon as the response is sent, so this holds only genuinely
+    /// concurrent work rather than growing for the life of the session.
+    inflight: std.StringHashMap(void),
+    /// Guards `inflight`. Requests on one session are serialized today, but
+    /// the table is the seam a worker pool would contend on.
+    inflight_mutex: std.Io.Mutex = .init,
     /// Seconds since the epoch when this session was last used.
     last_seen_s: i64 = 0,
 
@@ -266,7 +274,57 @@ pub const Session = struct {
         return .{
             .tasks = .init(allocator),
             .pending_requests = .init(allocator),
+            .inflight = .init(allocator),
         };
+    }
+
+    /// Number of client requests that may be in flight on one session at once.
+    pub const max_inflight_requests = 256;
+
+    /// A key that distinguishes integer id 5 from string id "5".
+    fn inflightKey(allocator: std.mem.Allocator, id: types.RequestId) ![]u8 {
+        return switch (id) {
+            .integer => |value| std.fmt.allocPrint(allocator, "i:{d}", .{value}),
+            .string => |value| std.fmt.allocPrint(allocator, "s:{s}", .{value}),
+        };
+    }
+
+    const Claim = enum { claimed, duplicate, at_capacity };
+
+    /// Take ownership of a request id for the duration of the request.
+    ///
+    /// The key is allocated from the session's own allocator, not from the
+    /// caller's: the per-message allocator is an arena that is destroyed long
+    /// before a concurrent request could observe the entry.
+    fn claimRequestId(self: *Session, io: std.Io, id: types.RequestId) !Claim {
+        const allocator = self.inflight.allocator;
+        const key = try inflightKey(allocator, id);
+        errdefer allocator.free(key);
+
+        self.inflight_mutex.lock(io) catch return error.Canceled;
+        defer self.inflight_mutex.unlock(io);
+
+        if (self.inflight.contains(key)) {
+            allocator.free(key);
+            return .duplicate;
+        }
+        if (self.inflight.count() >= max_inflight_requests) {
+            allocator.free(key);
+            return .at_capacity;
+        }
+        try self.inflight.put(key, {});
+        return .claimed;
+    }
+
+    fn releaseRequestId(self: *Session, io: std.Io, id: types.RequestId) void {
+        const allocator = self.inflight.allocator;
+        const key = inflightKey(allocator, id) catch return;
+        defer allocator.free(key);
+
+        self.inflight_mutex.lockUncancelable(io);
+        defer self.inflight_mutex.unlock(io);
+
+        if (self.inflight.fetchRemove(key)) |entry| allocator.free(entry.key);
     }
 
     /// Whether work for this session should stop early, because the client
@@ -315,6 +373,9 @@ pub const Session = struct {
         }
         self.tasks.deinit();
         self.pending_requests.deinit();
+        var inflight_it = self.inflight.keyIterator();
+        while (inflight_it.next()) |key| allocator.free(key.*);
+        self.inflight.deinit();
         self.deinitReplay(allocator);
         if (self.client_info) |ci| {
             allocator.free(ci.name);
@@ -1692,6 +1753,33 @@ pub const Server = struct {
             try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
             return;
         }
+
+        // JSON-RPC ids identify an exchange, so accepting a repeat while the
+        // original is outstanding would make the two responses ambiguous.
+        switch (try session.claimRequestId(io, request.id)) {
+            .claimed => {},
+            .duplicate => {
+                const error_response = jsonrpc.createErrorResponse(
+                    request.id,
+                    jsonrpc.ErrorCode.INVALID_REQUEST,
+                    "Duplicate request id",
+                    null,
+                );
+                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+                return;
+            },
+            .at_capacity => {
+                const error_response = jsonrpc.createErrorResponse(
+                    request.id,
+                    jsonrpc.ErrorCode.INTERNAL_ERROR,
+                    "Too many requests in flight",
+                    null,
+                );
+                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+                return;
+            },
+        }
+        defer session.releaseRequestId(io, request.id);
 
         if (std.mem.eql(u8, request.method, "initialize")) {
             try self.handleInitialize(session, io, allocator, request);
@@ -3887,4 +3975,110 @@ test "handleMessageAlloc leaves an existing reply sink in place" {
     try std.testing.expect(server.implicit_session.reply != null);
     // The response went to the caller, not to the sink that was already there.
     try std.testing.expectEqual(@as(usize, 0), outer.messages.items.len);
+}
+
+/// Initialize `server` through its public message API so later requests are
+/// accepted, discarding the handshake response.
+fn testInitialize(server: *Server, io: std.Io) !void {
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
+    );
+    reply.deinit();
+}
+
+test "a repeated request id is rejected while the original is in flight" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try testInitialize(&server, io);
+
+    // Stand in for a request that is still being served.
+    const claim = try server.implicit_session.claimRequestId(io, .{ .integer = 1 });
+    try std.testing.expectEqual(Session.Claim.claimed, claim);
+
+    const clash = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"ping"}
+    );
+    defer clash.deinit();
+    const clash_body = clash.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, clash_body, "-32600") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clash_body, "Duplicate request id") != null);
+
+    // Once the original completes the id is usable again.
+    server.implicit_session.releaseRequestId(io, .{ .integer = 1 });
+    const ok = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"ping"}
+    );
+    defer ok.deinit();
+    const ok_body = ok.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, ok_body, "\"result\"") != null);
+}
+
+test "a request id is released as soon as its response is sent" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try testInitialize(&server, io);
+
+    for (0..3) |_| {
+        const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+            \\{"jsonrpc":"2.0","id":7,"method":"ping"}
+        );
+        defer reply.deinit();
+        const body = reply.response() orelse return error.NoResponse;
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"result\"") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.implicit_session.inflight.count());
+}
+
+test "integer and string request ids with the same digits do not collide" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try testInitialize(&server, io);
+
+    try std.testing.expectEqual(Session.Claim.claimed, try server.implicit_session.claimRequestId(io, .{ .integer = 5 }));
+    defer server.implicit_session.releaseRequestId(io, .{ .integer = 5 });
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":"5","method":"ping"}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"result\"") != null);
+}
+
+test "the in-flight table is bounded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try testInitialize(&server, io);
+
+    for (0..Session.max_inflight_requests) |i| {
+        const claimed = try server.implicit_session.claimRequestId(io, .{ .integer = @intCast(1000 + i) });
+        try std.testing.expectEqual(Session.Claim.claimed, claimed);
+    }
+    defer for (0..Session.max_inflight_requests) |i| {
+        server.implicit_session.releaseRequestId(io, .{ .integer = @intCast(1000 + i) });
+    };
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"ping"}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32603") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Too many requests in flight") != null);
 }
