@@ -1401,26 +1401,30 @@ pub const Server = struct {
 
         // One over the cap, so a body that exceeds it is detectable rather
         // than silently truncated into a parse error.
-        const body_items = body_reader.readAlloc(allocator, max_http_body_size + 1) catch {
-            try request.respond("Failed to read request body", .{
-                .status = .bad_request,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/plain" },
+        // `allocRemaining`, not `readAlloc`: the latter reads *exactly* the
+        // length asked for and reports `EndOfStream` for anything shorter,
+        // which is every request body a client actually sends.
+        //
+        // The limit is one over the cap, and `allocRemaining` stops as soon as
+        // it is reached, so a body at exactly the cap is accepted and the first
+        // byte past it is rejected without reading the rest.
+        const body_items = body_reader.allocRemaining(
+            allocator,
+            .limited(max_http_body_size + 1),
+        ) catch |err| {
+            const too_large = err == error.StreamTooLong;
+            try request.respond(
+                if (too_large) "Request body too large" else "Failed to read request body",
+                .{
+                    .status = if (too_large) .payload_too_large else .bad_request,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/plain" },
+                    },
                 },
-            });
+            );
             return;
         };
         defer allocator.free(body_items);
-
-        if (body_items.len > max_http_body_size) {
-            try request.respond("Request body too large", .{
-                .status = .payload_too_large,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/plain" },
-                },
-            });
-            return;
-        }
 
         if (body_items.len == 0) {
             try request.respond("Empty JSON-RPC payload", .{
