@@ -230,6 +230,33 @@ originates from the victim's own browser.
 try client.connectHttp(io, allocator, "http://localhost:8080");
 ```
 
+`connectHttpOptions` adds headers to every request, for auth schemes and
+routing headers the transport does not model itself:
+
+```zig
+try client.connectHttpOptions(io, allocator, "https://example.test/mcp", .{
+    .extra_headers = &.{
+        .{ .name = "X-Api-Key", .value = api_key },
+        .{ .name = "X-Tenant", .value = "acme" },
+    },
+});
+```
+
+Header names and values are validated because they typically come from a
+config file, which is an untrusted-input boundary:
+
+- names must be RFC 9110 tokens, values may not contain CR, LF or NUL, so a
+  value cannot inject a second header;
+- `Content-Type`, `Accept`, `MCP-Protocol-Version` and `MCP-Session-Id` are
+  reserved (`error.ReservedHeader`) — overriding them breaks the protocol
+  rather than customising it;
+- `Authorization` may come from `extra_headers` *or*
+  `setAuthorizationToken`, not both (`error.DuplicateAuthorization`).
+
+Validation is all-or-nothing: a rejected batch leaves the previous headers in
+place. Like the bearer token, these headers are never sent across a redirect —
+the transport refuses to follow one at all.
+
 ### Endpoints
 
 | Endpoint | Method | Description             |
