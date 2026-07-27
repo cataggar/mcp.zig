@@ -294,6 +294,10 @@ const url = mcp.ISSUES_URL;
 
 To ensure your application is running the latest version of mcp.zig, you can enable background update checks. This will check GitHub Releases and log a message if a new version is available.
 
+The library never does this on your behalf. `Client` only starts an update check when you set `check_for_updates` in `ClientConfig`, and `Server` never starts one at all, so constructing either will not contact a third-party host. Call `checkForUpdates` yourself if you want it.
+
+The worker borrows the allocator you pass it, so join the thread before that allocator goes away. Detaching it lets the check run on past `deinit` and touch freed memory.
+
 ```zig
 pub fn main(init: std.process.Init) void {
     run(init.io, init.gpa) catch |err| {
@@ -302,9 +306,11 @@ pub fn main(init: std.process.Init) void {
 }
 
 fn run(io: std.Io, allocator: std.mem.Allocator) !void {
-    // Check for updates in background
-    // This runs on a separate thread; detach to let it run in background
-    if (mcp.report.checkForUpdates(io, allocator)) |t| t.detach();
+    // Optional: check GitHub Releases for a newer mcp.zig. This performs
+    // network I/O and the thread borrows `allocator`, so join it rather than
+    // detaching -- a detached worker can outlive the allocator it is using.
+    const update_thread = mcp.report.checkForUpdates(io, allocator);
+    defer if (update_thread) |t| t.join();
 
     // Continue with server initialization...
 }

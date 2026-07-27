@@ -21,6 +21,10 @@ pub const ClientConfig = struct {
     description: ?[]const u8 = null,
     icons: ?[]const types.Icon = null,
     websiteUrl: ?[]const u8 = null,
+    /// Opt in to a background check against GitHub Releases for a newer
+    /// mcp.zig. Off by default: constructing a client must not contact a
+    /// third-party host the caller never asked to reach.
+    check_for_updates: bool = false,
 };
 
 /// Connection state of the client.
@@ -63,7 +67,7 @@ pub const Client = struct {
             .config = config,
             .pending_requests = .init(allocator),
             .roots_list = .empty,
-            .update_thread = report.checkForUpdates(io, allocator),
+            .update_thread = if (config.check_for_updates) report.checkForUpdates(io, allocator) else null,
         };
     }
 
@@ -490,4 +494,25 @@ test "Client add root" {
 
     try client.addRoot(std.testing.allocator, "file:///tmp", "Temp");
     try std.testing.expectEqual(@as(usize, 1), client.roots_list.items.len);
+}
+
+test "constructing a client does not contact the network by default" {
+    // The update check performs an HTTPS fetch on a thread that borrows this
+    // allocator. It must be opt-in, so a default-configured client must not
+    // start it.
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    const cfg: ClientConfig = .{ .name = "c", .version = "1.0.0" };
+    try std.testing.expect(!cfg.check_for_updates);
+
+    // Assert on the call, not on the returned thread: `checkForUpdates` has a
+    // process-wide one-shot latch, so an earlier test could mask an implicit
+    // call here.
+    const before = report.invocation_count.load(.monotonic);
+    var client: Client = .init(threaded.io(), allocator, cfg);
+    defer client.deinit(allocator);
+    try std.testing.expectEqual(before, report.invocation_count.load(.monotonic));
+    try std.testing.expect(client.update_thread == null);
 }
