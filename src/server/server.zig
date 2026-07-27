@@ -89,46 +89,116 @@ pub const ServerConfig = struct {
     instructions: ?[]const u8 = null,
 };
 
-/// Current state of the server
-pub const ServerState = enum {
+/// Lifecycle of the server process itself.
+///
+/// This is deliberately separate from `SessionState`: whether the server is
+/// still accepting messages is a server-wide concern, while the MCP
+/// initialization handshake is per-client.
+pub const Lifecycle = enum {
+    running,
+    shutting_down,
+    stopped,
+};
+
+/// Initialization state of a single client session.
+pub const SessionState = enum {
     uninitialized,
     initializing,
     ready,
-    shutting_down,
-    stopped,
+};
+
+/// A request this server sent to a client and is still awaiting a reply for.
+pub const PendingRequest = struct {
+    method: []const u8,
+    timestamp: i64,
+};
+
+const TaskEntry = struct {
+    task: types.Task,
+    result_json: []const u8,
+};
+
+/// Per-client state.
+///
+/// Everything a client can mutate lives here rather than on `Server`, so one
+/// client cannot observe or clobber another's handshake, log level or tasks.
+/// `Server` keeps only immutable registrations (tools/resources/prompts) and
+/// the session table.
+pub const Session = struct {
+    /// Session identifier handed to the client as `Mcp-Session-Id`.
+    /// `null` for the implicit session used by stdio and custom transports,
+    /// which are single-client by construction.
+    id: ?[]const u8 = null,
+    state: SessionState = .uninitialized,
+    client_info: ?types.Implementation = null,
+    client_capabilities: ?types.ClientCapabilities = null,
+    log_level: protocol.LogLevel = .info,
+    tasks: std.StringHashMap(TaskEntry),
+    pending_requests: std.AutoHashMap(i64, PendingRequest),
+    next_request_id: i64 = 1,
+    /// Seconds since the epoch when this session was last used.
+    last_seen_s: i64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator) Session {
+        return .{
+            .tasks = .init(allocator),
+            .pending_requests = .init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Session, allocator: std.mem.Allocator) void {
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            // The map key aliases `task.taskId`, so it must not be freed twice.
+            allocator.free(entry.value_ptr.task.taskId);
+            allocator.free(entry.value_ptr.task.createdAt);
+            allocator.free(entry.value_ptr.task.lastUpdatedAt);
+            if (entry.value_ptr.task.statusMessage) |msg| allocator.free(msg);
+            allocator.free(entry.value_ptr.result_json);
+        }
+        self.tasks.deinit();
+        self.pending_requests.deinit();
+        if (self.client_info) |ci| {
+            allocator.free(ci.name);
+            allocator.free(ci.version);
+            self.client_info = null;
+        }
+        if (self.id) |sid| {
+            allocator.free(sid);
+            self.id = null;
+        }
+    }
 };
 
 /// MCP Server that handles client connections and routes requests
 pub const Server = struct {
     allocator: std.mem.Allocator,
     config: ServerConfig,
-    state: ServerState = .uninitialized,
+    lifecycle: Lifecycle = .running,
     tools: std.StringHashMap(tools_mod.Tool),
     resources: std.StringHashMap(resources_mod.Resource),
     resource_templates: std.StringHashMap(resources_mod.ResourceTemplate),
     prompts: std.StringHashMap(prompts_mod.Prompt),
-    tasks: std.StringHashMap(TaskEntry),
     capabilities: types.ServerCapabilities = .{},
-    client_info: ?types.Implementation = null,
-    client_capabilities: ?types.ClientCapabilities = null,
     transport: ?transport_mod.Transport = null,
     stdio_transport: ?*transport_mod.StdioTransport = null,
-    next_request_id: i64 = 1,
-    pending_requests: std.AutoHashMap(i64, PendingRequest),
-    log_level: protocol.LogLevel = .info,
+    /// Sessions addressable by `Mcp-Session-Id`, used by the HTTP transport.
+    sessions: std.StringHashMap(*Session),
+    /// Single implicit session for stdio and custom transports, which carry
+    /// exactly one client and have no way to convey a session id.
+    implicit_session: Session,
+    /// Maximum number of concurrently tracked HTTP sessions.
+    max_sessions: usize = 256,
+    /// Idle time, in seconds, after which an HTTP session is reclaimed.
+    session_idle_timeout_s: i64 = 5 * 60,
+    /// Maximum number of tasks retained per session.
+    max_tasks_per_session: usize = 256,
     pub const max_http_body_size: usize = 4 * 1024 * 1024;
 
     const Self = @This();
 
-    pub const PendingRequest = struct {
-        method: []const u8,
-        timestamp: i64,
-    };
-
-    const TaskEntry = struct {
-        task: types.Task,
-        result_json: []const u8,
-    };
+    /// Number of random bytes in a generated session id.
+    const session_id_entropy_bytes = 32;
 
     /// Initialize a new MCP Server
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) Self {
@@ -139,8 +209,8 @@ pub const Server = struct {
             .resources = .init(allocator),
             .resource_templates = .init(allocator),
             .prompts = .init(allocator),
-            .tasks = .init(allocator),
-            .pending_requests = .init(allocator),
+            .sessions = .init(allocator),
+            .implicit_session = .init(allocator),
         };
     }
 
@@ -150,18 +220,100 @@ pub const Server = struct {
         self.resources.deinit();
         self.resource_templates.deinit();
         self.prompts.deinit();
-        self.deinitTasks();
-        self.pending_requests.deinit();
-        if (self.client_info) |ci| {
-            self.allocator.free(ci.name);
-            self.allocator.free(ci.version);
-            self.client_info = null;
+        self.implicit_session.deinit(self.allocator);
+        var sit = self.sessions.iterator();
+        while (sit.next()) |entry| {
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
         }
+        self.sessions.deinit();
         if (self.stdio_transport) |stdio| {
             stdio.deinit(self.allocator);
             self.allocator.destroy(stdio);
             self.stdio_transport = null;
         }
+    }
+
+    fn nowSeconds(io: std.Io) i64 {
+        return std.Io.Clock.real.now(io).toSeconds();
+    }
+
+    /// Derive the session-table key from a session id.
+    ///
+    /// The table is keyed by the SHA-256 digest of the id rather than the id
+    /// itself so that lookups never run a short-circuiting comparison against
+    /// the secret a client presented.
+    fn sessionKey(id: []const u8, out: *[std.crypto.hash.sha2.Sha256.digest_length * 2]u8) []const u8 {
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(id, &digest, .{});
+        const hex_chars = "0123456789abcdef";
+        for (digest, 0..) |b, i| {
+            out[i * 2] = hex_chars[b >> 4];
+            out[i * 2 + 1] = hex_chars[b & 0x0f];
+        }
+        return out[0..];
+    }
+
+    const CreatedSession = struct {
+        session: *Session,
+        /// The id to hand to the client. Owned by the server allocator.
+        plaintext_id: []u8,
+    };
+
+    /// Mint an unregistered session with a fresh CSPRNG identifier.
+    fn createSession(self: *Self, io: std.Io) !CreatedSession {
+        self.sweepIdleSessions(io);
+        if (self.sessions.count() >= self.max_sessions) return error.TooManySessions;
+
+        // No fallback to a non-secure RNG here: the session id is an
+        // authorization token, so a weak source must fail the request.
+        var raw: [session_id_entropy_bytes]u8 = undefined;
+        try io.randomSecure(&raw);
+        const hex_chars = "0123456789abcdef";
+        const plaintext = try self.allocator.alloc(u8, raw.len * 2);
+        errdefer self.allocator.free(plaintext);
+        for (raw, 0..) |b, i| {
+            plaintext[i * 2] = hex_chars[b >> 4];
+            plaintext[i * 2 + 1] = hex_chars[b & 0x0f];
+        }
+
+        var key_buf: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+        const key = try self.allocator.dupe(u8, sessionKey(plaintext, &key_buf));
+        errdefer self.allocator.free(key);
+
+        const session = try self.allocator.create(Session);
+        session.* = .init(self.allocator);
+        session.id = key;
+        session.last_seen_s = nowSeconds(io);
+        return .{ .session = session, .plaintext_id = plaintext };
+    }
+
+    /// Look up a registered session by the id a client presented.
+    fn lookupSession(self: *Self, presented_id: []const u8) ?*Session {
+        var key_buf: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+        return self.sessions.get(sessionKey(presented_id, &key_buf));
+    }
+
+    /// Tear a session down, removing it from the table if it was registered.
+    fn destroySession(self: *Self, session: *Session) void {
+        if (session.id) |key| _ = self.sessions.remove(key);
+        session.deinit(self.allocator);
+        self.allocator.destroy(session);
+    }
+
+    /// Drop sessions that have been idle past `session_idle_timeout_s`.
+    fn sweepIdleSessions(self: *Self, io: std.Io) void {
+        if (self.sessions.count() == 0) return;
+        const now = nowSeconds(io);
+        var expired: std.ArrayList(*Session) = .empty;
+        defer expired.deinit(self.allocator);
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (now -| entry.value_ptr.*.last_seen_s > self.session_idle_timeout_s) {
+                expired.append(self.allocator, entry.value_ptr.*) catch return;
+            }
+        }
+        for (expired.items) |session| self.destroySession(session);
     }
 
     /// Add a tool to the server
@@ -336,7 +488,7 @@ pub const Server = struct {
         var listener = try std.Io.net.IpAddress.listen(&address, io, .{});
         defer listener.deinit(io);
 
-        while (self.state != .stopped and self.state != .shutting_down) {
+        while (self.lifecycle == .running) {
             const stream = listener.accept(io) catch |err| {
                 std.log.err("HTTP accept failed: {s}", .{@errorName(err)});
                 continue;
@@ -362,7 +514,8 @@ pub const Server = struct {
             else => return err,
         };
 
-        if (request.head.method != .POST) {
+        // POST carries JSON-RPC; DELETE terminates a session.
+        if (request.head.method != .POST and request.head.method != .DELETE) {
             try request.respond("Method Not Allowed", .{
                 .status = .method_not_allowed,
                 .extra_headers = &.{
@@ -390,7 +543,7 @@ pub const Server = struct {
         // `application/json` is not a CORS-simple content type, so requiring it
         // forces a preflight that this server never answers. That is what stops
         // a page from POSTing here with `text/plain` and no preflight at all.
-        if (!hasJsonContentType(&request)) {
+        if (request.head.method == .POST and !hasJsonContentType(&request)) {
             try request.respond("Expected Content-Type: application/json", .{
                 .status = .unsupported_media_type,
                 .extra_headers = &.{
@@ -415,7 +568,33 @@ pub const Server = struct {
             }
         }
 
+        if (request.head.method == .DELETE) {
+            try self.handleHttpSessionDelete(&request);
+            return;
+        }
+
         try self.handleHttpJsonRpcRequest(io, allocator, &request);
+    }
+
+    /// Handle `DELETE` — explicit session termination.
+    ///
+    /// Without this a client has no way to release its state early and the
+    /// table only drains on the idle sweep.
+    fn handleHttpSessionDelete(self: *Self, request: *http.Server.Request) !void {
+        var header_it = http.HeaderIterator.init(request.head_buffer);
+        while (header_it.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) continue;
+            const session = self.lookupSession(header.value) orelse break;
+            self.destroySession(session);
+            try request.respond("", .{ .status = .no_content });
+            return;
+        }
+        try request.respond("Unknown or expired MCP session", .{
+            .status = .not_found,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+            },
+        });
     }
 
     /// Whether the request carries `Authorization: Bearer <expected>`.
@@ -495,14 +674,31 @@ pub const Server = struct {
 
     fn handleHttpJsonRpcRequest(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: *http.Server.Request) !void {
         var wants_sse = false;
+        var provided_session_id: ?[]const u8 = null;
         var header_it = http.HeaderIterator.init(request.head_buffer);
         while (header_it.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "accept")) {
                 if (std.mem.indexOf(u8, header.value, "text/event-stream") != null) {
                     wants_sse = true;
                 }
+            } else if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) {
+                provided_session_id = header.value;
             }
         }
+        var session: *Session = undefined;
+        if (provided_session_id) |sid| {
+            session = self.lookupSession(sid) orelse {
+                try request.respond("Unknown or expired MCP session", .{
+                    .status = .not_found,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/plain" },
+                    },
+                });
+                return;
+            };
+            session.last_seen_s = nowSeconds(io);
+        }
+
         const content_length = request.head.content_length orelse {
             try request.respond("Content-Length required", .{
                 .status = .bad_request,
@@ -565,6 +761,33 @@ pub const Server = struct {
         };
         defer allocator.free(body_items);
 
+        // A request that arrives without a session id is only meaningful if it
+        // is `initialize`. Rather than pre-parsing the body, serve it with an
+        // unregistered session and keep that session only if the handshake
+        // actually happened. Anything else gets `Server not initialized`.
+        var provisional: ?*Session = null;
+        var provisional_plaintext_id: ?[]u8 = null;
+        defer if (provisional_plaintext_id) |pid| self.allocator.free(pid);
+        var keep_provisional = false;
+        defer if (provisional) |p| {
+            if (!keep_provisional) self.destroySession(p);
+        };
+
+        if (provided_session_id == null) {
+            const created = self.createSession(io) catch {
+                try request.respond("Too many active MCP sessions", .{
+                    .status = .service_unavailable,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/plain" },
+                    },
+                });
+                return;
+            };
+            provisional = created.session;
+            provisional_plaintext_id = created.plaintext_id;
+            session = created.session;
+        }
+
         var request_transport: HttpRequestTransport = .{ .owner_allocator = allocator };
         defer request_transport.deinit();
 
@@ -572,7 +795,7 @@ pub const Server = struct {
         self.transport = request_transport.transport();
         defer self.transport = previous_transport;
 
-        self.handleMessage(io, allocator, body_items) catch {
+        self.handleMessage(session, io, allocator, body_items) catch {
             const internal_error = jsonrpc.createParseError(.{ .string = "Internal server error" });
             const json = jsonrpc.serializeMessage(allocator, .{ .error_response = internal_error }) catch {
                 try request.respond("Internal server error", .{
@@ -594,29 +817,49 @@ pub const Server = struct {
             return;
         };
 
+        // Only a completed handshake earns a durable session. Anything else
+        // leaves the provisional session to be discarded by the deferred
+        // cleanup above, so unauthenticated traffic cannot grow the table.
+        var emit_session_id: ?[]const u8 = null;
+        if (provisional) |p| {
+            if (p.state != .uninitialized) {
+                try self.sessions.put(p.id.?, p);
+                keep_provisional = true;
+                emit_session_id = provisional_plaintext_id.?;
+            }
+        }
+
+        var header_buf: [2]http.Header = undefined;
+        header_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
+        var header_len: usize = 1;
+        if (emit_session_id) |sid| {
+            header_buf[1] = .{ .name = "Mcp-Session-Id", .value = sid };
+            header_len = 2;
+        }
+
         if (request_transport.response_message) |response_json| {
             if (wants_sse) {
                 const sse_body = try std.fmt.allocPrint(allocator, "data: {s}\n\n", .{response_json});
                 defer allocator.free(sse_body);
+                header_buf[0] = .{ .name = "Content-Type", .value = "text/event-stream" };
                 try request.respond(sse_body, .{
                     .status = .ok,
-                    .extra_headers = &.{
-                        .{ .name = "Content-Type", .value = "text/event-stream" },
-                    },
+                    .extra_headers = header_buf[0..header_len],
                 });
                 return;
             }
 
             try request.respond(response_json, .{
                 .status = .ok,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json" },
-                },
+                .extra_headers = header_buf[0..header_len],
             });
             return;
         }
 
-        try request.respond("", .{ .status = .accepted });
+        try request.respond("", .{
+            .status = .accepted,
+            .extra_headers = header_buf[0..header_len],
+        });
     }
 
     /// Run the server with a custom transport
@@ -627,11 +870,14 @@ pub const Server = struct {
 
     /// Main message processing loop
     fn messageLoop(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
-        while (self.state != .stopped and self.state != .shutting_down) {
+        // stdio and custom transports carry exactly one client, so they share
+        // the implicit session for the lifetime of the process.
+        const session = &self.implicit_session;
+        while (self.lifecycle == .running) {
             const message_data = self.transport.?.receive(io, allocator) catch |err| {
                 switch (err) {
                     error.EndOfStream => {
-                        self.state = .shutting_down;
+                        self.lifecycle = .shutting_down;
                         break;
                     },
                     else => |e| {
@@ -641,7 +887,7 @@ pub const Server = struct {
                         } else |_| {
                             self.logError(io, "Transport receive error");
                         }
-                        self.state = .shutting_down;
+                        self.lifecycle = .shutting_down;
                         break;
                     },
                 }
@@ -649,15 +895,15 @@ pub const Server = struct {
 
             if (message_data) |data| {
                 defer allocator.free(data);
-                try self.handleMessage(io, allocator, data);
+                try self.handleMessage(session, io, allocator, data);
             }
         }
 
-        self.state = .stopped;
+        self.lifecycle = .stopped;
     }
 
     /// Handle an incoming message
-    fn handleMessage(self: *Self, io: std.Io, allocator: std.mem.Allocator, data: []const u8) !void {
+    fn handleMessage(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, data: []const u8) !void {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const aa = arena.allocator();
@@ -669,21 +915,21 @@ pub const Server = struct {
         };
 
         switch (parsed_message.message) {
-            .request => |req| try self.handleRequest(io, aa, req),
-            .notification => |notif| try self.handleNotification(io, notif),
-            .response => |resp| self.handleResponse(resp),
-            .error_response => |err| self.handleErrorResponse(io, err),
+            .request => |req| try self.handleRequest(session, io, aa, req),
+            .notification => |notif| try self.handleNotification(session, io, notif),
+            .response => |resp| self.handleResponse(session, resp),
+            .error_response => |err| self.handleErrorResponse(session, io, err),
         }
     }
 
     /// Handle an incoming request
-    fn handleRequest(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleRequest(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var buf: [256]u8 = undefined;
         if (std.fmt.bufPrint(&buf, "Received request: {s}", .{request.method})) |msg| {
             self.log(io, msg);
         } else |_| {}
 
-        if (self.state == .uninitialized and !std.mem.eql(u8, request.method, "initialize")) {
+        if (session.state == .uninitialized and !std.mem.eql(u8, request.method, "initialize")) {
             const error_response = jsonrpc.createErrorResponse(
                 request.id,
                 jsonrpc.ErrorCode.SERVER_NOT_INITIALIZED,
@@ -695,13 +941,13 @@ pub const Server = struct {
         }
 
         if (std.mem.eql(u8, request.method, "initialize")) {
-            try self.handleInitialize(io, allocator, request);
+            try self.handleInitialize(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "ping")) {
             try self.handlePing(io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tools/list")) {
             try self.handleToolsList(io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tools/call")) {
-            try self.handleToolsCall(io, allocator, request);
+            try self.handleToolsCall(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/list")) {
             try self.handleResourcesList(io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/read")) {
@@ -717,17 +963,17 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, request.method, "prompts/get")) {
             try self.handlePromptsGet(io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "logging/setLevel")) {
-            try self.handleSetLogLevel(io, allocator, request);
+            try self.handleSetLogLevel(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "completion/complete")) {
             try self.handleCompletion(io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tasks/get")) {
-            try self.handleTasksGet(io, allocator, request);
+            try self.handleTasksGet(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tasks/result")) {
-            try self.handleTasksResult(io, allocator, request);
+            try self.handleTasksResult(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tasks/list")) {
-            try self.handleTasksList(io, allocator, request);
+            try self.handleTasksList(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tasks/cancel")) {
-            try self.handleTasksCancel(io, allocator, request);
+            try self.handleTasksCancel(session, io, allocator, request);
         } else {
             const error_response = jsonrpc.createMethodNotFound(request.id, request.method);
             try self.sendResponse(io, allocator, .{ .error_response = error_response });
@@ -735,8 +981,8 @@ pub const Server = struct {
     }
 
     /// Handle initialize request
-    fn handleInitialize(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
-        self.state = .initializing;
+    fn handleInitialize(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+        session.state = .initializing;
 
         if (request.params) |params| {
             if (params == .object) {
@@ -747,11 +993,11 @@ pub const Server = struct {
                         const ci = client_info_val.object;
                         const name = if (ci.get("name")) |n| if (n == .string) n.string else "unknown" else "unknown";
                         const version = if (ci.get("version")) |v| if (v == .string) v.string else "0.0.0" else "0.0.0";
-                        if (self.client_info) |existing| {
+                        if (session.client_info) |existing| {
                             self.allocator.free(existing.name);
                             self.allocator.free(existing.version);
                         }
-                        self.client_info = .{
+                        session.client_info = .{
                             .name = try self.allocator.dupe(u8, name),
                             .version = try self.allocator.dupe(u8, version),
                         };
@@ -930,7 +1176,7 @@ pub const Server = struct {
     }
 
     /// Handle tools/call request
-    fn handleToolsCall(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleToolsCall(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var tool_name: []const u8 = "";
         var arguments: ?std.json.Value = null;
         var task_meta: ?types.TaskMetadata = null;
@@ -975,6 +1221,16 @@ pub const Server = struct {
                 }
 
                 var status_message: ?[]const u8 = null;
+                if (session.tasks.count() >= self.max_tasks_per_session) {
+                    const error_response = jsonrpc.createErrorResponse(
+                        request.id,
+                        jsonrpc.ErrorCode.INTERNAL_ERROR,
+                        "Task limit reached for this session",
+                        null,
+                    );
+                    try self.sendResponse(io, allocator, .{ .error_response = error_response });
+                    return;
+                }
                 const tool_result: tools_mod.ToolResult = tool.handler(tool.user_data, io, allocator, arguments) catch |err| blk: {
                     const msg = try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
                     status_message = msg;
@@ -998,7 +1254,7 @@ pub const Server = struct {
                     .pollInterval = null,
                 };
 
-                try self.tasks.put(task_id, .{ .task = task, .result_json = result_json });
+                try session.tasks.put(task_id, .{ .task = task, .result_json = result_json });
 
                 const task_obj = try buildTaskObject(allocator, task);
                 var result: std.json.ObjectMap = .empty;
@@ -1295,28 +1551,28 @@ pub const Server = struct {
     }
 
     /// Handle logging/setLevel request
-    fn handleSetLogLevel(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleSetLogLevel(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         if (request.params) |params| {
             if (params == .object) {
                 if (params.object.get("level")) |level_val| {
                     if (level_val == .string) {
                         const level_str = level_val.string;
                         if (std.mem.eql(u8, level_str, "debug")) {
-                            self.log_level = .debug;
+                            session.log_level = .debug;
                         } else if (std.mem.eql(u8, level_str, "info")) {
-                            self.log_level = .info;
+                            session.log_level = .info;
                         } else if (std.mem.eql(u8, level_str, "notice")) {
-                            self.log_level = .notice;
+                            session.log_level = .notice;
                         } else if (std.mem.eql(u8, level_str, "warning")) {
-                            self.log_level = .warning;
+                            session.log_level = .warning;
                         } else if (std.mem.eql(u8, level_str, "error")) {
-                            self.log_level = .@"error";
+                            session.log_level = .@"error";
                         } else if (std.mem.eql(u8, level_str, "critical")) {
-                            self.log_level = .critical;
+                            session.log_level = .critical;
                         } else if (std.mem.eql(u8, level_str, "alert")) {
-                            self.log_level = .alert;
+                            session.log_level = .alert;
                         } else if (std.mem.eql(u8, level_str, "emergency")) {
-                            self.log_level = .emergency;
+                            session.log_level = .emergency;
                         }
                     }
                 }
@@ -1343,7 +1599,7 @@ pub const Server = struct {
     }
 
     /// Handle tasks/get request
-    fn handleTasksGet(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleTasksGet(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var task_id: ?[]const u8 = null;
         if (request.params) |params| {
             if (params == .object) {
@@ -1361,7 +1617,7 @@ pub const Server = struct {
             return;
         };
 
-        if (self.tasks.get(id)) |entry| {
+        if (session.tasks.get(id)) |entry| {
             const task_obj = try buildTaskObject(allocator, entry.task);
             const response = jsonrpc.createResponse(request.id, .{ .object = task_obj });
             try self.sendResponse(io, allocator, .{ .response = response });
@@ -1372,7 +1628,7 @@ pub const Server = struct {
     }
 
     /// Handle tasks/result request
-    fn handleTasksResult(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleTasksResult(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var task_id: ?[]const u8 = null;
         if (request.params) |params| {
             if (params == .object) {
@@ -1390,7 +1646,7 @@ pub const Server = struct {
             return;
         };
 
-        if (self.tasks.get(id)) |entry| {
+        if (session.tasks.get(id)) |entry| {
             const parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.result_json, .{});
             defer parsed.deinit();
 
@@ -1417,11 +1673,11 @@ pub const Server = struct {
     }
 
     /// Handle tasks/list request
-    fn handleTasksList(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleTasksList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var result: std.json.ObjectMap = .empty;
         var tasks_array: std.json.Array = .init(allocator);
 
-        var iter = self.tasks.iterator();
+        var iter = session.tasks.iterator();
         while (iter.next()) |entry| {
             const task_obj = try buildTaskObject(allocator, entry.value_ptr.task);
             try tasks_array.append(.{ .object = task_obj });
@@ -1433,7 +1689,7 @@ pub const Server = struct {
     }
 
     /// Handle tasks/cancel request
-    fn handleTasksCancel(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+    fn handleTasksCancel(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var task_id: ?[]const u8 = null;
         if (request.params) |params| {
             if (params == .object) {
@@ -1451,7 +1707,7 @@ pub const Server = struct {
             return;
         };
 
-        if (self.tasks.getPtr(id)) |entry| {
+        if (session.tasks.getPtr(id)) |entry| {
             if (entry.task.status == .completed or entry.task.status == .failed or entry.task.status == .cancelled) {
                 const error_response = jsonrpc.createInvalidParams(request.id, "Task already in terminal status");
                 try self.sendResponse(io, allocator, .{ .error_response = error_response });
@@ -1473,9 +1729,9 @@ pub const Server = struct {
     }
 
     /// Handle incoming notifications
-    fn handleNotification(self: *Self, io: std.Io, notification: jsonrpc.Notification) !void {
+    fn handleNotification(self: *Self, session: *Session, io: std.Io, notification: jsonrpc.Notification) !void {
         if (std.mem.eql(u8, notification.method, "notifications/initialized")) {
-            self.state = .ready;
+            session.state = .ready;
             self.log(io, "Server initialized and ready");
         } else if (std.mem.eql(u8, notification.method, "notifications/cancelled")) {
             if (notification.params) |params| {
@@ -1491,22 +1747,22 @@ pub const Server = struct {
     }
 
     /// Handle incoming response to a request we sent
-    fn handleResponse(self: *Self, response: jsonrpc.Response) void {
+    fn handleResponse(_: *Self, session: *Session, response: jsonrpc.Response) void {
         const id = switch (response.id) {
             .integer => |i| i,
             .string => return,
         };
-        _ = self.pending_requests.remove(id);
+        _ = session.pending_requests.remove(id);
     }
 
     /// Handle incoming error response
-    fn handleErrorResponse(self: *Self, io: std.Io, err: jsonrpc.ErrorResponse) void {
+    fn handleErrorResponse(self: *Self, session: *Session, io: std.Io, err: jsonrpc.ErrorResponse) void {
         if (err.id) |id| {
             const int_id = switch (id) {
                 .integer => |i| i,
                 .string => return,
             };
-            _ = self.pending_requests.remove(int_id);
+            _ = session.pending_requests.remove(int_id);
         }
         self.logError(io, err.@"error".message);
     }
@@ -1519,7 +1775,7 @@ pub const Server = struct {
 
     /// Send a log message notification
     pub fn sendLogMessage(self: *Self, io: std.Io, allocator: std.mem.Allocator, level: protocol.LogLevel, message: []const u8) !void {
-        if (@intFromEnum(level) < @intFromEnum(self.log_level)) return;
+        if (@intFromEnum(level) < @intFromEnum(self.implicit_session.log_level)) return;
 
         var params: std.json.ObjectMap = .empty;
         try params.put(allocator, "level", .{ .string = level.toString() });
@@ -1577,20 +1833,6 @@ pub const Server = struct {
                 return;
             };
         }
-    }
-
-    fn deinitTasks(self: *Self) void {
-        var iter = self.tasks.iterator();
-        while (iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.task.taskId);
-            self.allocator.free(entry.value_ptr.task.createdAt);
-            self.allocator.free(entry.value_ptr.task.lastUpdatedAt);
-            if (entry.value_ptr.task.statusMessage) |msg| {
-                self.allocator.free(msg);
-            }
-            self.allocator.free(entry.value_ptr.result_json);
-        }
-        self.tasks.deinit();
     }
 
     fn nowIsoTimestamp(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
@@ -1773,7 +2015,8 @@ test "Server initialization" {
     });
     defer server.deinit();
 
-    try std.testing.expectEqual(ServerState.uninitialized, server.state);
+    try std.testing.expectEqual(SessionState.uninitialized, server.implicit_session.state);
+    try std.testing.expectEqual(Lifecycle.running, server.lifecycle);
     try std.testing.expectEqualStrings("test-server", server.config.name);
 }
 
@@ -1887,7 +2130,7 @@ test "HttpRequestTransport response outlives the per-message arena" {
         var buf: [128]u8 = undefined;
         const body = try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"ping\"}}", .{i});
 
-        try server.handleMessage(io, std.testing.allocator, body);
+        try server.handleMessage(&server.implicit_session, io, std.testing.allocator, body);
 
         // Read the response after handleMessage has returned, i.e. after its
         // arena has been destroyed. This is the use-after-free.
@@ -2040,4 +2283,245 @@ test "originIsAllowed rejects everything when no origins are configured" {
     try std.testing.expect(!Server.originIsAllowed("https://app.example.com", none));
     try std.testing.expect(!Server.originIsAllowed("null", none));
     try std.testing.expect(!Server.originIsAllowed("", none));
+}
+
+/// Drive one JSON-RPC message through `server` on `session` and return the
+/// response body. Caller owns the returned slice.
+fn testRoundTrip(server: *Server, session: *Session, io: std.Io, message: []const u8) ![]u8 {
+    var request_transport: HttpRequestTransport = .{ .owner_allocator = std.testing.allocator };
+    defer request_transport.deinit();
+
+    const previous_transport = server.transport;
+    server.transport = request_transport.transport();
+    defer server.transport = previous_transport;
+
+    try server.handleMessage(session, io, std.testing.allocator, message);
+    const response = request_transport.response_message orelse return error.NoResponseProduced;
+    return std.testing.allocator.dupe(u8, response);
+}
+
+/// Create a session and register it, as a completed handshake would.
+fn testRegisterSession(server: *Server, io: std.Io) !*Session {
+    const created = try server.createSession(io);
+    defer std.testing.allocator.free(created.plaintext_id);
+    try server.sessions.put(created.session.id.?, created.session);
+    return created.session;
+}
+
+const test_initialize_message =
+    \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
+;
+
+test "initialize on one session does not initialize another" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+
+    const a = try testRegisterSession(&server, io);
+    const b = try testRegisterSession(&server, io);
+
+    const resp_a = try testRoundTrip(&server, a, io, test_initialize_message);
+    defer std.testing.allocator.free(resp_a);
+    try std.testing.expect(std.mem.indexOf(u8, resp_a, "\"result\"") != null);
+    try std.testing.expect(a.state != .uninitialized);
+
+    // The handshake belongs to `a` alone. Before per-session state this was a
+    // single field on Server, so `b` inherited it and skipped initialize.
+    try std.testing.expectEqual(SessionState.uninitialized, b.state);
+
+    const resp_b = try testRoundTrip(&server, b, io,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    );
+    defer std.testing.allocator.free(resp_b);
+    try std.testing.expect(std.mem.indexOf(u8, resp_b, "Server not initialized") != null);
+}
+
+test "tasks are not readable across sessions" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+
+    const a = try testRegisterSession(&server, io);
+    const b = try testRegisterSession(&server, io);
+    for ([_]*Session{ a, b }) |s| {
+        const resp = try testRoundTrip(&server, s, io, test_initialize_message);
+        std.testing.allocator.free(resp);
+    }
+
+    // Strings here are freed by Session.deinit, which mirrors the real
+    // ownership: the map key aliases task.taskId.
+    const task_id = try std.testing.allocator.dupe(u8, "task-abc");
+    const created_at = try std.testing.allocator.dupe(u8, "2026-01-01T00:00:00Z");
+    const updated_at = try std.testing.allocator.dupe(u8, "2026-01-01T00:00:00Z");
+    const result_json = try std.testing.allocator.dupe(u8, "{}");
+    try a.tasks.put(task_id, .{
+        .task = .{
+            .taskId = task_id,
+            .status = .completed,
+            .statusMessage = null,
+            .createdAt = created_at,
+            .lastUpdatedAt = updated_at,
+            .ttl = null,
+            .pollInterval = null,
+        },
+        .result_json = result_json,
+    });
+
+    const get_msg =
+        \\{"jsonrpc":"2.0","id":3,"method":"tasks/get","params":{"taskId":"task-abc"}}
+    ;
+
+    const owner_resp = try testRoundTrip(&server, a, io, get_msg);
+    defer std.testing.allocator.free(owner_resp);
+    try std.testing.expect(std.mem.indexOf(u8, owner_resp, "task-abc") != null);
+
+    // A second client must not be able to read another client's task.
+    const other_resp = try testRoundTrip(&server, b, io, get_msg);
+    defer std.testing.allocator.free(other_resp);
+    try std.testing.expect(std.mem.indexOf(u8, other_resp, "task-abc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, other_resp, "\"error\"") != null);
+}
+
+test "logging/setLevel is scoped to the calling session" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+
+    const a = try testRegisterSession(&server, io);
+    const b = try testRegisterSession(&server, io);
+    for ([_]*Session{ a, b }) |s| {
+        const resp = try testRoundTrip(&server, s, io, test_initialize_message);
+        std.testing.allocator.free(resp);
+    }
+
+    const resp = try testRoundTrip(&server, a, io,
+        \\{"jsonrpc":"2.0","id":4,"method":"logging/setLevel","params":{"level":"emergency"}}
+    );
+    defer std.testing.allocator.free(resp);
+
+    try std.testing.expectEqual(protocol.LogLevel.emergency, a.log_level);
+    // One client must not be able to silence another's notifications.
+    try std.testing.expectEqual(protocol.LogLevel.info, b.log_level);
+}
+
+test "session lookup only succeeds for the exact issued id" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+
+    const created = try server.createSession(io);
+    defer std.testing.allocator.free(created.plaintext_id);
+    try server.sessions.put(created.session.id.?, created.session);
+
+    // 32 random bytes rendered as hex.
+    try std.testing.expectEqual(@as(usize, 64), created.plaintext_id.len);
+    for (created.plaintext_id) |c| {
+        try std.testing.expect(std.ascii.isHex(c));
+    }
+
+    try std.testing.expect(server.lookupSession(created.plaintext_id) == created.session);
+    try std.testing.expect(server.lookupSession("") == null);
+    try std.testing.expect(server.lookupSession("not-a-session") == null);
+    // The table is keyed by digest, so the digest is not itself a valid id.
+    try std.testing.expect(server.lookupSession(created.session.id.?) == null);
+}
+
+test "session ids are unique per session" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+
+    const first = try server.createSession(io);
+    defer std.testing.allocator.free(first.plaintext_id);
+    try server.sessions.put(first.session.id.?, first.session);
+
+    const second = try server.createSession(io);
+    defer std.testing.allocator.free(second.plaintext_id);
+    try server.sessions.put(second.session.id.?, second.session);
+
+    try std.testing.expect(!std.mem.eql(u8, first.plaintext_id, second.plaintext_id));
+}
+
+test "idle sessions are reclaimed" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+
+    const session = try testRegisterSession(&server, io);
+    try std.testing.expectEqual(@as(usize, 1), server.sessions.count());
+
+    session.last_seen_s = 0;
+    server.session_idle_timeout_s = 1;
+    server.sweepIdleSessions(io);
+
+    try std.testing.expectEqual(@as(usize, 0), server.sessions.count());
+}
+
+test "session table is capped" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+    server.max_sessions = 1;
+
+    _ = try testRegisterSession(&server, io);
+    try std.testing.expectError(error.TooManySessions, server.createSession(io));
+}
+
+test "destroySession removes the session from the table" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+
+    const created = try server.createSession(io);
+    defer std.testing.allocator.free(created.plaintext_id);
+    try server.sessions.put(created.session.id.?, created.session);
+
+    server.destroySession(created.session);
+    try std.testing.expectEqual(@as(usize, 0), server.sessions.count());
+    try std.testing.expect(server.lookupSession(created.plaintext_id) == null);
+}
+
+test "an unregistered provisional session is freed cleanly" {
+    // Every request that arrives without a session id mints a provisional
+    // session that is discarded unless the handshake succeeds. The testing
+    // allocator fails this test if that discard path leaks.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1.0.0" });
+    defer server.deinit();
+
+    for (0..8) |_| {
+        const created = try server.createSession(io);
+        defer std.testing.allocator.free(created.plaintext_id);
+        try std.testing.expectEqual(SessionState.uninitialized, created.session.state);
+        server.destroySession(created.session);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), server.sessions.count());
 }
