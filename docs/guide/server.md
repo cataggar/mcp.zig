@@ -25,6 +25,24 @@ defer server.deinit();
 | icons | ?[]const mcp.types.Icon | Optional icon list |
 | websiteUrl | ?[]const u8 | Optional website URL |
 | instructions | ?[]const u8 | Optional server usage instructions |
+| page_size | usize | Maximum items per `*/list` response. `0` (default) returns everything in one page. |
+
+### Pagination
+
+With `page_size` set, `tools/list`, `resources/list`,
+`resources/templates/list` and `prompts/list` return at most that many items
+and a `nextCursor`, which the client passes back as `params.cursor`.
+
+Entries are ordered by name before paging. Hash map iteration order is not
+stable across insertions, so paging over the raw order could skip or repeat
+entries whenever a component is registered mid-walk; a total order makes
+"everything after X" well defined regardless. It also means a cursor whose key
+has since been removed resumes correctly instead of stranding the walk.
+
+Cursors are opaque (base64url of an internal key). One the server never issued
+is answered with `-32602 Invalid cursor`; it does not drop the connection.
+
+`page_size = 0` is the historical behaviour and never emits `nextCursor`.
 
 ## Capabilities
 

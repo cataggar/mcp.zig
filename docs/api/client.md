@@ -102,16 +102,24 @@ A JSON-RPC error response returns `error.ServerError`; the code and message are
 then available in `client.last_error`.
 
 ```zig
-pub fn listTools(self: *Client, io: std.Io, allocator: std.mem.Allocator) !Response
+pub fn listTools(self: *Client, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response
 pub fn callTool(self: *Client, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !Response
 
-pub fn listResources(self: *Client, io: std.Io, allocator: std.mem.Allocator) !Response
+pub fn listResources(self: *Client, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response
 pub fn readResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response
 pub fn subscribeResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response
 pub fn unsubscribeResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response
-pub fn listResourceTemplates(self: *Client, io: std.Io, allocator: std.mem.Allocator) !Response
+pub fn listResourceTemplates(self: *Client, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response
 
-pub fn listPrompts(self: *Client, io: std.Io, allocator: std.mem.Allocator) !Response
+pub fn listPrompts(self: *Client, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response
+
+// Walk every page. Prefer these unless you are driving the paging yourself:
+// a bare `list*` call returns only the first page, and against a paginating
+// server that is silent data loss.
+pub fn listAllTools(self: *Client, io: std.Io, allocator: std.mem.Allocator) !PagedItems
+pub fn listAllResources(self: *Client, io: std.Io, allocator: std.mem.Allocator) !PagedItems
+pub fn listAllResourceTemplates(self: *Client, io: std.Io, allocator: std.mem.Allocator) !PagedItems
+pub fn listAllPrompts(self: *Client, io: std.Io, allocator: std.mem.Allocator) !PagedItems
 pub fn getPrompt(self: *Client, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !Response
 
 pub fn complete(self: *Client, io: std.Io, allocator: std.mem.Allocator, ref: std.json.Value, argument: std.json.Value) !Response

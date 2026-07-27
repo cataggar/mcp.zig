@@ -100,7 +100,87 @@ pub const ServerConfig = struct {
     icons: ?[]const types.Icon = null,
     websiteUrl: ?[]const u8 = null,
     instructions: ?[]const u8 = null,
+    /// Maximum items returned by one `*/list` request.
+    ///
+    /// `0` (the default) returns everything in a single page and never emits
+    /// `nextCursor`, which is the historical behaviour.
+    page_size: usize = 0,
 };
+
+/// One page of a `*/list` response.
+const Page = struct {
+    /// Sorted keys belonging to this page.
+    keys: []const []const u8,
+    /// Opaque cursor for the next page, or null if this is the last one.
+    /// Allocated from the request allocator.
+    next_cursor: ?[]const u8,
+};
+
+/// A cursor is the last key of the previous page, base64url-encoded so the
+/// caller has no reason to construct or mutate one.
+const cursor_codec = std.base64.url_safe_no_pad;
+
+fn lessThanKey(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+/// Selects the page of `keys` following `cursor`.
+///
+/// `keys` is sorted in place. Sorting matters: hash map iteration order is not
+/// stable across insertions, so paging over the raw order could skip or repeat
+/// entries whenever a tool is registered mid-walk. A total order over the keys
+/// makes "everything after X" well defined regardless.
+fn paginateKeys(
+    allocator: std.mem.Allocator,
+    keys: [][]const u8,
+    cursor: ?[]const u8,
+    page_size: usize,
+) !Page {
+    std.mem.sort([]const u8, keys, {}, lessThanKey);
+
+    var start: usize = 0;
+    if (cursor) |encoded| {
+        const decoded_len = cursor_codec.Decoder.calcSizeForSlice(encoded) catch
+            return error.InvalidCursor;
+        const decoded = try allocator.alloc(u8, decoded_len);
+        defer allocator.free(decoded);
+        cursor_codec.Decoder.decode(decoded, encoded) catch return error.InvalidCursor;
+
+        // Resume strictly after the last key we handed out. A key that has
+        // since been removed does not strand the walk.
+        while (start < keys.len and std.mem.order(u8, keys[start], decoded) != .gt) {
+            start += 1;
+        }
+    }
+
+    if (page_size == 0) {
+        return .{ .keys = keys[start..], .next_cursor = null };
+    }
+
+    const end = @min(start + page_size, keys.len);
+    const window = keys[start..end];
+    if (end >= keys.len or window.len == 0) {
+        return .{ .keys = window, .next_cursor = null };
+    }
+
+    const last = window[window.len - 1];
+    const encoded = try allocator.alloc(u8, cursor_codec.Encoder.calcSize(last.len));
+    _ = cursor_codec.Encoder.encode(encoded, last);
+    return .{ .keys = window, .next_cursor = encoded };
+}
+
+/// Reads the `cursor` param of a `*/list` request.
+fn listCursor(request: jsonrpc.Request) ?[]const u8 {
+    const params = request.params orelse return null;
+    const obj = switch (params) {
+        .object => |o| o,
+        else => return null,
+    };
+    return switch (obj.get("cursor") orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
 
 /// Lifecycle of the server process itself.
 ///
@@ -1553,21 +1633,41 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, request.method, "ping")) {
             try self.handlePing(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "tools/list")) {
-            try self.handleToolsList(session, io, allocator, request);
+            self.handleToolsList(session, io, allocator, request) catch |err| switch (err) {
+                // A cursor the client did not get from us is bad input, not a
+                // reason to drop the connection.
+                error.InvalidCursor => try self.sendInvalidCursor(session, io, allocator, request),
+                else => |e| return e,
+            };
         } else if (std.mem.eql(u8, request.method, "tools/call")) {
             try self.handleToolsCall(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/list")) {
-            try self.handleResourcesList(session, io, allocator, request);
+            self.handleResourcesList(session, io, allocator, request) catch |err| switch (err) {
+                // A cursor the client did not get from us is bad input, not a
+                // reason to drop the connection.
+                error.InvalidCursor => try self.sendInvalidCursor(session, io, allocator, request),
+                else => |e| return e,
+            };
         } else if (std.mem.eql(u8, request.method, "resources/read")) {
             try self.handleResourcesRead(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/templates/list")) {
-            try self.handleResourceTemplatesList(session, io, allocator, request);
+            self.handleResourceTemplatesList(session, io, allocator, request) catch |err| switch (err) {
+                // A cursor the client did not get from us is bad input, not a
+                // reason to drop the connection.
+                error.InvalidCursor => try self.sendInvalidCursor(session, io, allocator, request),
+                else => |e| return e,
+            };
         } else if (std.mem.eql(u8, request.method, "resources/subscribe")) {
             try self.handleSubscribe(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "resources/unsubscribe")) {
             try self.handleUnsubscribe(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "prompts/list")) {
-            try self.handlePromptsList(session, io, allocator, request);
+            self.handlePromptsList(session, io, allocator, request) catch |err| switch (err) {
+                // A cursor the client did not get from us is bad input, not a
+                // reason to drop the connection.
+                error.InvalidCursor => try self.sendInvalidCursor(session, io, allocator, request),
+                else => |e| return e,
+            };
         } else if (std.mem.eql(u8, request.method, "prompts/get")) {
             try self.handlePromptsGet(session, io, allocator, request);
         } else if (std.mem.eql(u8, request.method, "logging/setLevel")) {
@@ -1707,11 +1807,32 @@ pub const Server = struct {
     }
 
     /// Handle tools/list request
+    fn sendInvalidCursor(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+        const error_response = jsonrpc.createErrorResponse(
+            request.id,
+            jsonrpc.ErrorCode.INVALID_PARAMS,
+            "Invalid cursor",
+            null,
+        );
+        try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+    }
+
+    /// Collects the keys of `map`, sorts them and returns the page selected by
+    /// the request's `cursor`.
+    fn pageOf(self: *Self, map: anytype, allocator: std.mem.Allocator, request: jsonrpc.Request) !Page {
+        const keys = try allocator.alloc([]const u8, map.count());
+        var iter = map.keyIterator();
+        var i: usize = 0;
+        while (iter.next()) |k| : (i += 1) keys[i] = k.*;
+        return paginateKeys(allocator, keys, listCursor(request), self.config.page_size);
+    }
+
     fn handleToolsList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var tools_array: std.json.Array = .init(allocator);
 
-        var iter = self.tools.iterator();
-        while (iter.next()) |entry| {
+        const page = try self.pageOf(self.tools, allocator, request);
+        for (page.keys) |page_key| {
+            const entry = self.tools.getEntry(page_key).?;
             var tool_obj: std.json.ObjectMap = .empty;
             try tool_obj.put(allocator, "name", .{ .string = entry.value_ptr.name });
             if (entry.value_ptr.description) |desc| {
@@ -1778,6 +1899,7 @@ pub const Server = struct {
 
         var result: std.json.ObjectMap = .empty;
         try result.put(allocator, "tools", .{ .array = tools_array });
+        if (page.next_cursor) |next| try result.put(allocator, "nextCursor", .{ .string = next });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
         try self.sendResponse(session, io, allocator, .{ .response = response });
@@ -1895,8 +2017,9 @@ pub const Server = struct {
     fn handleResourcesList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var resources_array: std.json.Array = .init(allocator);
 
-        var iter = self.resources.iterator();
-        while (iter.next()) |entry| {
+        const page = try self.pageOf(self.resources, allocator, request);
+        for (page.keys) |page_key| {
+            const entry = self.resources.getEntry(page_key).?;
             var resource_obj: std.json.ObjectMap = .empty;
             try resource_obj.put(allocator, "uri", .{ .string = entry.value_ptr.uri });
             try resource_obj.put(allocator, "name", .{ .string = entry.value_ptr.name });
@@ -1926,6 +2049,7 @@ pub const Server = struct {
 
         var result: std.json.ObjectMap = .empty;
         try result.put(allocator, "resources", .{ .array = resources_array });
+        if (page.next_cursor) |next| try result.put(allocator, "nextCursor", .{ .string = next });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
         try self.sendResponse(session, io, allocator, .{ .response = response });
@@ -1984,8 +2108,9 @@ pub const Server = struct {
     fn handleResourceTemplatesList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var templates_array: std.json.Array = .init(allocator);
 
-        var iter = self.resource_templates.iterator();
-        while (iter.next()) |entry| {
+        const page = try self.pageOf(self.resource_templates, allocator, request);
+        for (page.keys) |page_key| {
+            const entry = self.resource_templates.getEntry(page_key).?;
             var template_obj: std.json.ObjectMap = .empty;
             try template_obj.put(allocator, "uriTemplate", .{ .string = entry.value_ptr.uriTemplate });
             try template_obj.put(allocator, "name", .{ .string = entry.value_ptr.name });
@@ -2012,6 +2137,7 @@ pub const Server = struct {
 
         var result: std.json.ObjectMap = .empty;
         try result.put(allocator, "resourceTemplates", .{ .array = templates_array });
+        if (page.next_cursor) |next| try result.put(allocator, "nextCursor", .{ .string = next });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
         try self.sendResponse(session, io, allocator, .{ .response = response });
@@ -2039,8 +2165,9 @@ pub const Server = struct {
     fn handlePromptsList(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         var prompts_array: std.json.Array = .init(allocator);
 
-        var iter = self.prompts.iterator();
-        while (iter.next()) |entry| {
+        const page = try self.pageOf(self.prompts, allocator, request);
+        for (page.keys) |page_key| {
+            const entry = self.prompts.getEntry(page_key).?;
             var prompt_obj: std.json.ObjectMap = .empty;
             try prompt_obj.put(allocator, "name", .{ .string = entry.value_ptr.name });
             if (entry.value_ptr.description) |desc| {
@@ -2079,6 +2206,7 @@ pub const Server = struct {
 
         var result: std.json.ObjectMap = .empty;
         try result.put(allocator, "prompts", .{ .array = prompts_array });
+        if (page.next_cursor) |next| try result.put(allocator, "nextCursor", .{ .string = next });
 
         const response = jsonrpc.createResponse(request.id, .{ .object = result });
         try self.sendResponse(session, io, allocator, .{ .response = response });
@@ -3497,4 +3625,138 @@ test "server notifications reach every live session's stream" {
     try server.sendNotification(io, std.testing.allocator, "notifications/tools/list_changed", null);
     try std.testing.expectEqual(@as(usize, 2), a.replay.items.len);
     try std.testing.expectEqual(@as(usize, 1), b.replay.items.len);
+}
+
+fn testNoopTool(
+    _: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    _: ?std.json.Value,
+) tools_mod.ToolError!tools_mod.ToolResult {
+    return tools_mod.textResult(allocator, "ok") catch tools_mod.ToolError.OutOfMemory;
+}
+
+fn testAddNamedTool(server: *Server, name: []const u8) !void {
+    try server.addTool(.{ .name = name, .description = "x", .handler = testNoopTool });
+}
+
+test "tools/list pages through a bounded page_size" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{
+        .name = "t",
+        .version = "1",
+        .page_size = 2,
+    });
+    defer server.deinit();
+    server.implicit_session.state = .ready;
+
+    for ([_][]const u8{ "e", "a", "d", "b", "c" }) |name| try testAddNamedTool(&server, name);
+
+    // Walk every page and collect the names in the order the server hands
+    // them out.
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(std.testing.allocator);
+
+    var cursor: ?[]const u8 = null;
+    var cursor_buf: [128]u8 = undefined;
+    var round_trips: usize = 0;
+    while (round_trips < 10) {
+        var body_buf: [256]u8 = undefined;
+        const body = if (cursor) |c|
+            try std.fmt.bufPrint(&body_buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{\"cursor\":\"{s}\"}}}}", .{c})
+        else
+            try std.fmt.bufPrint(&body_buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}}", .{});
+
+        const response = try testRoundTrip(&server, &server.implicit_session, io, body);
+        defer std.testing.allocator.free(response);
+        round_trips += 1;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result").?.object;
+        const tools = result.get("tools").?.array;
+        try std.testing.expect(tools.items.len <= 2);
+        for (tools.items) |tool| {
+            try seen.appendSlice(std.testing.allocator, tool.object.get("name").?.string);
+        }
+
+        const next = result.get("nextCursor") orelse break;
+        cursor = try std.fmt.bufPrint(&cursor_buf, "{s}", .{next.string});
+    }
+
+    // Every tool exactly once, in the sorted order that makes paging stable.
+    try std.testing.expectEqualStrings("abcde", seen.items);
+    try std.testing.expectEqual(@as(usize, 3), round_trips);
+}
+
+test "page_size 0 returns everything with no cursor" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+    server.implicit_session.state = .ready;
+
+    for ([_][]const u8{ "a", "b", "c" }) |name| try testAddNamedTool(&server, name);
+
+    const response = try testRoundTrip(&server, &server.implicit_session, io, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    defer std.testing.allocator.free(response);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(usize, 3), result.get("tools").?.array.items.len);
+    try std.testing.expect(result.get("nextCursor") == null);
+}
+
+test "a cursor the server never issued is invalid params, not a dropped connection" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1", .page_size = 1 });
+    defer server.deinit();
+    server.implicit_session.state = .ready;
+    try testAddNamedTool(&server, "a");
+
+    const response = try testRoundTrip(
+        &server,
+        &server.implicit_session,
+        io,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"cursor\":\"not base64!!\"}}",
+    );
+    defer std.testing.allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Invalid cursor") != null);
+}
+
+test "paginateKeys resumes after a key that has since been removed" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Cursor points at "b", which is no longer in the set.
+    var encoded: [16]u8 = undefined;
+    const cursor = encoded[0..cursor_codec.Encoder.calcSize(1)];
+    _ = cursor_codec.Encoder.encode(cursor, "b");
+
+    var keys = [_][]const u8{ "c", "a", "d" };
+    const page = try paginateKeys(aa, &keys, cursor, 5);
+    try std.testing.expectEqual(@as(usize, 2), page.keys.len);
+    try std.testing.expectEqualStrings("c", page.keys[0]);
+    try std.testing.expectEqualStrings("d", page.keys[1]);
 }

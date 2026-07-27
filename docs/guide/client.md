@@ -53,15 +53,51 @@ client.enableRoots(true);
 client.enableSampling();
 ```
 
+## Pagination
+
+`*/list` methods are cursor-paginated. `listTools`, `listResources`,
+`listResourceTemplates` and `listPrompts` each return **one page** and take a
+`ListOptions` carrying the cursor:
+
+```zig
+var cursor: ?[]const u8 = null;
+while (true) {
+    const page = try client.listTools(io, allocator, .{ .cursor = cursor });
+    defer page.deinit();
+    // ...
+    cursor = switch (page.get("nextCursor") orelse .null) {
+        .string => |c| c,
+        else => break,
+    };
+}
+```
+
+Most callers want everything, so prefer the `listAll*` helpers, which walk
+every page and return the concatenated items:
+
+```zig
+const tools = try client.listAllTools(io, allocator);
+defer tools.deinit();
+for (tools.items) |tool| { ... }
+```
+
+`items` are views into the retained page responses, so they stay valid until
+`deinit`. The walk is bounded: a server that repeats a cursor fails with
+`error.CursorNotAdvancing` and one that never stops fails with
+`error.TooManyPages`, rather than hanging the caller.
+
+Cursors are opaque. Do not construct one; a cursor the server did not issue is
+answered with `-32602 Invalid cursor`.
+
 ## Using Tools
 
 ### List Available Tools
 
 ```zig
-const tools = try client.listTools(io, allocator);
+const tools = try client.listAllTools(io, allocator);
 defer tools.deinit();
 
-for (tools.get("tools").?.array.items) |tool| {
+for (tools.items) |tool| {
     std.debug.print("{s}\n", .{tool.object.get("name").?.string});
 }
 ```
@@ -86,7 +122,7 @@ const text = result.get("content").?.array.items[0].object.get("text").?.string;
 ### List Resources
 
 ```zig
-try client.listResources(io, allocator);
+try client.listAllResources(io, allocator);
 ```
 
 ### Read a Resource
@@ -100,7 +136,7 @@ try client.readResource(io, allocator, "file:///data.json");
 ### List Prompts
 
 ```zig
-try client.listPrompts(io, allocator);
+try client.listAllPrompts(io, allocator);
 ```
 
 ### Get a Prompt
@@ -119,12 +155,10 @@ Request methods return a `Response`. `result` is the JSON-RPC `result` member,
 and it lives in the response's arena, so it is valid until `deinit`.
 
 ```zig
-const tools = try client.listTools(io, allocator);
+const tools = try client.listAllTools(io, allocator);
 defer tools.deinit();
 
-// `get` reads a field of the result object.
-const list = tools.get("tools") orelse return error.MissingTools;
-for (list.array.items) |tool| { ... }
+for (tools.items) |tool| { ... }
 ```
 
 If the server replies with a JSON-RPC error, the call returns
@@ -186,7 +220,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator) !void {
     try client.connectStdio(io, allocator, "./my-server", &.{});
 
     // List and call tools
-    const tools = try client.listTools(io, allocator);
+    const tools = try client.listAllTools(io, allocator);
     defer tools.deinit();
     std.debug.print("Available tools: {d}\n", .{tools.get("tools").?.array.items.len});
 

@@ -864,7 +864,7 @@ test "Client.connectHttp round-trips and frees everything it allocates" {
     try std.testing.expectEqualStrings("2025-11-25", client.negotiated_version.?);
     try std.testing.expect(client.serverCapabilities() != null);
 
-    const tools = try client.listTools(io, allocator);
+    const tools = try client.listTools(io, allocator, .{});
     defer tools.deinit();
 
     // The result actually reached the caller, rather than being dropped.
