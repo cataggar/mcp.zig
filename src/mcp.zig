@@ -88,6 +88,9 @@ pub const roots = @import("client/roots.zig");
 pub const sampling = @import("client/sampling.zig");
 
 // Utilities
+pub const config = @import("config.zig");
+pub const ServerSpec = config.ServerSpec;
+
 pub const utils = @import("utils/mod.zig");
 pub const errors = @import("utils/errors.zig");
 pub const logging = @import("utils/logging.zig");
