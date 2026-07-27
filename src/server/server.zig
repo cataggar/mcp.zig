@@ -2687,6 +2687,20 @@ pub const Server = struct {
                     try self.sendRequestCancelled(session, io, allocator, request);
                     return;
                 }
+                // The specification separates a call that was made wrongly from
+                // a call that ran and failed. Arguments the handler refuses are
+                // the former: no amount of reading the text would help the
+                // model, so it must not arrive as readable content.
+                if (err == tools_mod.ToolError.InvalidArguments) {
+                    const error_response = jsonrpc.createErrorResponse(
+                        request.id,
+                        jsonrpc.ErrorCode.INVALID_PARAMS,
+                        "Invalid params",
+                        .{ .string = tool_name },
+                    );
+                    try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+                    return;
+                }
                 var content = try allocator.alloc(types.ContentBlock, 1);
                 content[0] = .{ .text = .{ .text = @errorName(err) } };
                 const result_value = try buildToolCallResultValue(allocator, .{ .content = content, .is_error = true });
@@ -5299,4 +5313,67 @@ test "without workers the loop stays sequential and refuses nothing" {
     try std.testing.expect(scripted.sawResponse("\"id\":3"));
     try std.testing.expect(!scripted.sawResponse("-32000"));
     try std.testing.expectEqual(@as(usize, 0), server.workers_in_flight);
+}
+
+fn testRejectingTool(
+    _: ?*anyopaque,
+    _: std.Io,
+    _: std.mem.Allocator,
+    _: ?std.json.Value,
+) tools_mod.ToolError!tools_mod.ToolResult {
+    return tools_mod.ToolError.InvalidArguments;
+}
+
+fn testFailingTool(
+    _: ?*anyopaque,
+    _: std.Io,
+    _: std.mem.Allocator,
+    _: ?std.json.Value,
+) tools_mod.ToolError!tools_mod.ToolResult {
+    return tools_mod.ToolError.ExecutionFailed;
+}
+
+test "a tool that rejects its arguments answers with a protocol error" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try server.addTool(.{ .name = "picky", .description = "x", .handler = testRejectingTool });
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"picky","arguments":{}}}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message\":\"Invalid params\"") != null);
+    // The tool is named so a client can tell which call was malformed.
+    try std.testing.expect(std.mem.indexOf(u8, body, "picky") != null);
+    // Not a result, and in particular not one the model would read as text.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"result\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "isError") == null);
+}
+
+test "a tool that runs and fails is still reported as a result" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try server.addTool(.{ .name = "broken", .description = "x", .handler = testFailingTool });
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"broken","arguments":{}}}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    // An execution failure is something the model should see and react to.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"isError\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ExecutionFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"error\"") == null);
 }

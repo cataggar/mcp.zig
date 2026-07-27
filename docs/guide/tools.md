@@ -150,6 +150,33 @@ fn handler(_: ?*anyopaque, _: std.Io, allocator: Allocator, args: ?std.json.Valu
 }
 ```
 
+There are two kinds of failure and they are answered differently, because they
+mean different things to a client.
+
+`error.InvalidArguments` says the *call* was malformed, and is answered with a
+JSON-RPC protocol error naming the tool:
+
+```json
+{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params","data":"my_tool"}}
+```
+
+Every other error — `ExecutionFailed`, `PermissionDenied`, `ResourceNotFound`,
+`Timeout`, `Unknown` — says the call was well formed and the work failed, so it
+is answered as a result the model is expected to read and react to:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ExecutionFailed"}],"isError":true}}
+```
+
+Use `error.InvalidArguments` only for arguments you refuse to act on. Asking a
+model to retry a call it made correctly is wasted work, and hiding a genuine
+argument error inside readable content leaves the model rephrasing a request
+that was never going to be accepted.
+
+For a failure the model should see with an explanation, prefer returning
+`mcp.tools.errorResult(allocator, "…")` over an error value, so the text is
+yours rather than an error name.
+
 ## Tool Builder
 
 Use the builder pattern for complex tools:
