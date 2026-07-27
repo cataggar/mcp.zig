@@ -44,3 +44,40 @@ The following changes were introduced in the MCP specification revision 2025-11-
 - Establish shared communication practices and guidelines for the MCP community.
 - Formalize Working Groups and Interest Groups in MCP governance.
 - Establish SDK tiering system with clear requirements for feature support and maintenance commitments.
+
+## Choosing which versions a server speaks
+
+By default a server speaks every revision in `protocol.SUPPORTED_VERSIONS`
+and follows the spec's negotiation rule: when a client asks for a version it
+does not know, it replies with the newest version it *does* know and lets the
+client decide whether to continue.
+
+A host whose behaviour is only defined on one revision can say so:
+
+```zig
+var server: mcp.Server = .init(allocator, .{
+    .name = "my-server",
+    .version = "1.0.0",
+    .supported_protocol_versions = &.{"2025-11-25"},
+    .strict_protocol_version = true,
+});
+```
+
+- `supported_protocol_versions` — the set this server will speak, newest
+  first. `null` (the default) means the library's full list. The first entry is
+  what the server advertises when negotiating down, and the whole set is what
+  an `MCP-Protocol-Version` request header is validated against.
+- `strict_protocol_version` — when `true`, a client asking for a version
+  outside the set fails the handshake with `-32602 Unsupported protocol
+  version` (the `data` member lists what would work) instead of being
+  negotiated down.
+
+The two are independent. Pinning without `strict_protocol_version` narrows
+what the server advertises and accepts on the wire while still negotiating
+down politely; `strict_protocol_version` without pinning simply rejects
+revisions the library has never heard of.
+
+Note that pinning also tightens the HTTP header check. A request carrying no
+`MCP-Protocol-Version` is read as `2025-03-26`, per the spec, so a server
+pinned to a newer revision will answer such a request `400` — which is the
+point: an old client cannot silently be served.

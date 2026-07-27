@@ -25,6 +25,11 @@ pub const SUPPORTED_VERSIONS = [_][]const u8{
     "2024-11-05",
 };
 
+/// The version to assume when a client sends no `MCP-Protocol-Version`
+/// header, per the spec: the header was introduced after this revision, so its
+/// absence identifies a client that predates it.
+pub const ASSUMED_VERSION_WITHOUT_HEADER = "2025-03-26";
+
 /// JSON-RPC version used by MCP.
 pub const JSONRPC_VERSION = "2.0";
 
