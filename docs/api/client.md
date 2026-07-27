@@ -60,6 +60,37 @@ pub fn enableTasks(self: *Client) void
 pub fn enableTasksAdvanced(self: *Client, sampling: bool, elicitation: bool) void
 ```
 
+`initialize` fails with `error.MissingSamplingHandler` /
+`error.MissingElicitationHandler` if those capabilities are enabled without a
+matching handler. `roots` has a built-in handler and needs none.
+
+---
+
+## Server-Initiated Traffic
+
+```zig
+pub const RequestHandler = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!std.json.Value;
+
+pub const NotificationHandler = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!void;
+
+pub fn onRequest(self: *Client, allocator: std.mem.Allocator, method: []const u8, ctx: ?*anyopaque, handler: RequestHandler) !void
+pub fn onNotification(self: *Client, allocator: std.mem.Allocator, method: []const u8, ctx: ?*anyopaque, handler: NotificationHandler) !void
+pub fn hasRequestHandler(self: *const Client, method: []const u8) bool
+```
+
+`allocator` is an arena freed once the reply is serialized. Unhandled requests
+are answered `-32601`; failing handlers are answered `-32603`.
+
 ---
 
 ## Roots Management

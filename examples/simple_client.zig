@@ -30,10 +30,14 @@ fn run(io: std.Io, allocator: std.mem.Allocator, process_args: std.process.Args)
     });
     defer client.deinit(io, allocator);
 
-    // Declare supported capabilities
+    // Declare supported capabilities. `sampling` and `elicitation` are pure
+    // callbacks, so the handshake refuses to advertise them without a handler.
+    try client.onRequest(allocator, "sampling/createMessage", null, sampleMessage);
+    try client.onRequest(allocator, "elicitation/create", null, declineElicitation);
     client.enableSamplingAdvanced(true, true);
     client.enableElicitation();
     client.enableTasksAdvanced(true, true);
+    // `roots/list` is answered from the roots registered below.
     client.enableRoots(true);
 
     // Register file-system roots the server should respect
@@ -79,4 +83,34 @@ fn run(io: std.Io, allocator: std.mem.Allocator, process_args: std.process.Args)
         defer result.deinit();
         std.debug.print("\ncallTool({s}) returned a result\n", .{name});
     }
+}
+
+/// Stands in for a real LLM call.
+fn sampleMessage(
+    _: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    _: ?std.json.Value,
+) anyerror!std.json.Value {
+    var content: std.json.ObjectMap = .empty;
+    try content.put(allocator, "type", .{ .string = "text" });
+    try content.put(allocator, "text", .{ .string = "This client has no model attached." });
+
+    var result: std.json.ObjectMap = .empty;
+    try result.put(allocator, "role", .{ .string = "assistant" });
+    try result.put(allocator, "content", .{ .object = content });
+    try result.put(allocator, "model", .{ .string = "none" });
+    return .{ .object = result };
+}
+
+/// Declines every elicitation; a real client would prompt the user.
+fn declineElicitation(
+    _: ?*anyopaque,
+    _: std.Io,
+    allocator: std.mem.Allocator,
+    _: ?std.json.Value,
+) anyerror!std.json.Value {
+    var result: std.json.ObjectMap = .empty;
+    try result.put(allocator, "action", .{ .string = "decline" });
+    return .{ .object = result };
 }
