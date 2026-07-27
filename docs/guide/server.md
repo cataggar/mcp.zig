@@ -112,6 +112,32 @@ comes from the victim's own machine.
 
 The HTTP mode accepts JSON-RPC POST requests at the root path.
 
+### Driving the server yourself
+
+If your program already owns its I/O — an editor extension, an existing HTTP
+stack, or a test — you do not need a transport at all. `handleMessageAlloc`
+takes one JSON-RPC message and returns everything the server produced:
+
+```zig
+const reply = try server.handleMessageAlloc(io, allocator, line);
+defer reply.deinit();
+
+if (reply.response()) |body| {
+    // A request: `body` is the JSON-RPC response.
+    try out.writeAll(body);
+} else {
+    // A notification: the server produced nothing to send back.
+}
+```
+
+`Reply.messages` holds every message in the order the server produced it, so a
+handler that emits progress notifications before its result is preserved
+faithfully; `Reply.response()` is a convenience for the last one. All bytes are
+allocated from the allocator you pass and freed by `reply.deinit()`.
+
+This uses the implicit session, the same one stdio and custom transports use,
+so the handshake and session state behave exactly as they do under `run`.
+
 ## Registering Components
 
 ### Tools
