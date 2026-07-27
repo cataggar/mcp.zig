@@ -74,7 +74,20 @@ pub const Client = struct {
         if (self.authorization_token) |token| {
             allocator.free(token);
         }
-        if (self.update_thread) |t| t.detach();
+        // `connectStdio`/`connectHttp` allocate the transport, so the client
+        // owns it. Without this the endpoint, the session id and every queued
+        // response leak.
+        if (self.transport) |t| {
+            t.deinit(allocator);
+            self.transport = null;
+        }
+        // Join rather than detach. The worker borrows this allocator, so
+        // detaching lets it run on past the caller's `gpa.deinit()` and touch
+        // freed memory.
+        if (self.update_thread) |t| {
+            t.join();
+            self.update_thread = null;
+        }
     }
 
     /// Enables the sampling capability, allowing the server to request LLM completions.
@@ -172,94 +185,99 @@ pub const Client = struct {
 
     /// Sends the initialize request to begin the MCP handshake.
     fn initialize(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
-        var params: std.json.ObjectMap = .empty;
-        defer params.deinit(allocator);
+        // The params are a throwaway tree. `ObjectMap.deinit` is not
+        // recursive, so freeing only the root leaked every nested map.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
 
-        try params.put(allocator, "protocolVersion", .{ .string = protocol.VERSION });
+        var params: std.json.ObjectMap = .empty;
+
+        try params.put(aa, "protocolVersion", .{ .string = protocol.VERSION });
 
         var caps: std.json.ObjectMap = .empty;
         if (self.capabilities.sampling != null) {
             var sampling_cap: std.json.ObjectMap = .empty;
             if (self.capabilities.sampling.?.context != null) {
-                try sampling_cap.put(allocator, "context", .{ .object = .empty });
+                try sampling_cap.put(aa, "context", .{ .object = .empty });
             }
             if (self.capabilities.sampling.?.tools != null) {
-                try sampling_cap.put(allocator, "tools", .{ .object = .empty });
+                try sampling_cap.put(aa, "tools", .{ .object = .empty });
             }
-            try caps.put(allocator, "sampling", .{ .object = sampling_cap });
+            try caps.put(aa, "sampling", .{ .object = sampling_cap });
         }
         if (self.capabilities.roots) |r| {
             var roots_cap: std.json.ObjectMap = .empty;
-            try roots_cap.put(allocator, "listChanged", .{ .bool = r.listChanged });
-            try caps.put(allocator, "roots", .{ .object = roots_cap });
+            try roots_cap.put(aa, "listChanged", .{ .bool = r.listChanged });
+            try caps.put(aa, "roots", .{ .object = roots_cap });
         }
         if (self.capabilities.elicitation) |e| {
             var elicit_cap: std.json.ObjectMap = .empty;
             if (e.form != null) {
-                try elicit_cap.put(allocator, "form", .{ .object = .empty });
+                try elicit_cap.put(aa, "form", .{ .object = .empty });
             }
             if (e.url != null) {
-                try elicit_cap.put(allocator, "url", .{ .object = .empty });
+                try elicit_cap.put(aa, "url", .{ .object = .empty });
             }
-            try caps.put(allocator, "elicitation", .{ .object = elicit_cap });
+            try caps.put(aa, "elicitation", .{ .object = elicit_cap });
         }
         if (self.capabilities.tasks != null) {
             var tasks_cap: std.json.ObjectMap = .empty;
-            try tasks_cap.put(allocator, "list", .{ .object = .empty });
-            try tasks_cap.put(allocator, "cancel", .{ .object = .empty });
+            try tasks_cap.put(aa, "list", .{ .object = .empty });
+            try tasks_cap.put(aa, "cancel", .{ .object = .empty });
             if (self.capabilities.tasks.?.requests) |reqs| {
                 var requests_obj: std.json.ObjectMap = .empty;
                 if (reqs.sampling != null) {
                     var sampling_obj: std.json.ObjectMap = .empty;
-                    try sampling_obj.put(allocator, "createMessage", .{ .object = .empty });
-                    try requests_obj.put(allocator, "sampling", .{ .object = sampling_obj });
+                    try sampling_obj.put(aa, "createMessage", .{ .object = .empty });
+                    try requests_obj.put(aa, "sampling", .{ .object = sampling_obj });
                 }
                 if (reqs.elicitation != null) {
                     var elicitation_obj: std.json.ObjectMap = .empty;
-                    try elicitation_obj.put(allocator, "create", .{ .object = .empty });
-                    try requests_obj.put(allocator, "elicitation", .{ .object = elicitation_obj });
+                    try elicitation_obj.put(aa, "create", .{ .object = .empty });
+                    try requests_obj.put(aa, "elicitation", .{ .object = elicitation_obj });
                 }
-                try tasks_cap.put(allocator, "requests", .{ .object = requests_obj });
+                try tasks_cap.put(aa, "requests", .{ .object = requests_obj });
             }
-            try caps.put(allocator, "tasks", .{ .object = tasks_cap });
+            try caps.put(aa, "tasks", .{ .object = tasks_cap });
         }
-        try params.put(allocator, "capabilities", .{ .object = caps });
+        try params.put(aa, "capabilities", .{ .object = caps });
 
         var client_info: std.json.ObjectMap = .empty;
-        try client_info.put(allocator, "name", .{ .string = self.config.name });
-        try client_info.put(allocator, "version", .{ .string = self.config.version });
+        try client_info.put(aa, "name", .{ .string = self.config.name });
+        try client_info.put(aa, "version", .{ .string = self.config.version });
         if (self.config.title) |t| {
-            try client_info.put(allocator, "title", .{ .string = t });
+            try client_info.put(aa, "title", .{ .string = t });
         }
         if (self.config.description) |d| {
-            try client_info.put(allocator, "description", .{ .string = d });
+            try client_info.put(aa, "description", .{ .string = d });
         }
         if (self.config.icons) |icons| {
             var icons_array: std.json.Array = .init(allocator);
             for (icons) |icon| {
                 var icon_obj: std.json.ObjectMap = .empty;
-                try icon_obj.put(allocator, "src", .{ .string = icon.src });
+                try icon_obj.put(aa, "src", .{ .string = icon.src });
                 if (icon.mimeType) |mime| {
-                    try icon_obj.put(allocator, "mimeType", .{ .string = mime });
+                    try icon_obj.put(aa, "mimeType", .{ .string = mime });
                 }
                 if (icon.sizes) |sizes| {
                     var sizes_array: std.json.Array = .init(allocator);
                     for (sizes) |size| {
                         try sizes_array.append(.{ .string = size });
                     }
-                    try icon_obj.put(allocator, "sizes", .{ .array = sizes_array });
+                    try icon_obj.put(aa, "sizes", .{ .array = sizes_array });
                 }
                 if (icon.theme) |theme| {
-                    try icon_obj.put(allocator, "theme", .{ .string = @tagName(theme) });
+                    try icon_obj.put(aa, "theme", .{ .string = @tagName(theme) });
                 }
                 try icons_array.append(.{ .object = icon_obj });
             }
-            try client_info.put(allocator, "icons", .{ .array = icons_array });
+            try client_info.put(aa, "icons", .{ .array = icons_array });
         }
         if (self.config.websiteUrl) |u| {
-            try client_info.put(allocator, "websiteUrl", .{ .string = u });
+            try client_info.put(aa, "websiteUrl", .{ .string = u });
         }
-        try params.put(allocator, "clientInfo", .{ .object = client_info });
+        try params.put(aa, "clientInfo", .{ .object = client_info });
 
         try self.sendRequest(io, allocator, "initialize", .{ .object = params });
     }
