@@ -127,6 +127,36 @@ the body is read. The configuration is validated before the listener is
 created, so a server that would expose tools without authentication refuses to
 start.
 
+### Status codes
+
+| Situation | Status |
+| --------- | ------ |
+| Method other than `POST`/`DELETE` | `405` |
+| Disallowed `Origin` | `403` |
+| `Content-Type` other than `application/json` | `415` |
+| Missing or wrong `Authorization` | `401` with `WWW-Authenticate` |
+| Unsupported `MCP-Protocol-Version` | `400` |
+| Body over `max_http_body_size` | `413` |
+| Unknown session id | `404` |
+| Session id that existed and was terminated | `410` |
+| Too many active sessions | `503` |
+| Notification accepted, no response body | `202` |
+| `DELETE` of an idle session | `204` |
+| `DELETE` of a session with work still unwinding | `202` |
+
+A request body may be sent with `Content-Length` or with
+`Transfer-Encoding: chunked`; the size cap is enforced on the bytes actually
+read either way, not on the declared length alone.
+
+`MCP-Protocol-Version` is validated against the supported set and echoed on
+responses. A request without the header is read as `2025-03-26`, per the spec's
+backwards-compatibility rule.
+
+A session that is terminated while it still has work in flight is unpublished
+immediately and its `cancel_requested` flag is set. Long-running tool handlers
+should poll `session.isCancelled()` and abandon work whose result can no longer
+be delivered.
+
 ### Browser-originated requests
 
 Two checks run before authentication:

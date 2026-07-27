@@ -150,6 +150,9 @@ pub const Session = struct {
     /// Set when the session has been terminated but still has live references.
     /// The last reference to be released performs the teardown.
     closing: bool = false,
+    /// Set alongside `closing`. Long-running handlers should poll
+    /// `isCancelled` and abandon work whose result can no longer be delivered.
+    cancel_requested: bool = false,
     /// Session identifier handed to the client as `Mcp-Session-Id`.
     /// `null` for the implicit session used by stdio and custom transports,
     /// which are single-client by construction.
@@ -169,6 +172,12 @@ pub const Session = struct {
             .tasks = .init(allocator),
             .pending_requests = .init(allocator),
         };
+    }
+
+    /// Whether work for this session should stop early, because the client
+    /// went away or asked for termination. Long-running handlers should poll it.
+    pub fn isCancelled(self: *const Session) bool {
+        return self.cancel_requested;
     }
 
     pub fn deinit(self: *Session, allocator: std.mem.Allocator) void {
@@ -224,6 +233,12 @@ pub const Server = struct {
     stdio_transport: ?*transport_mod.StdioTransport = null,
     /// Sessions addressable by `Mcp-Session-Id`, used by the HTTP transport.
     sessions: std.StringHashMap(*Session),
+    /// Ids of sessions that existed and were terminated, so a later request
+    /// against one can be answered `410 Gone` — "re-initialize" — rather than
+    /// `404`, which is indistinguishable from a fabricated id.
+    terminated_sessions: std.StringHashMap(void),
+    /// Insertion order for `terminated_sessions`, used to evict the oldest.
+    terminated_order: std.ArrayList([]const u8) = .empty,
     /// Single implicit session for stdio and custom transports, which carry
     /// exactly one client and have no way to convey a session id.
     implicit_session: Session,
@@ -266,6 +281,7 @@ pub const Server = struct {
             .resource_templates = .init(allocator),
             .prompts = .init(allocator),
             .sessions = .init(allocator),
+            .terminated_sessions = .init(allocator),
             .implicit_session = .init(allocator),
         };
     }
@@ -283,6 +299,9 @@ pub const Server = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit();
+        for (self.terminated_order.items) |key| self.allocator.free(key);
+        self.terminated_order.deinit(self.allocator);
+        self.terminated_sessions.deinit();
         if (self.stdio_transport) |stdio| {
             stdio.deinit(self.allocator);
             self.allocator.destroy(stdio);
@@ -346,12 +365,28 @@ pub const Server = struct {
         return .{ .session = session, .plaintext_id = plaintext };
     }
 
+    /// Whether a client-presented `MCP-Protocol-Version` is one we speak.
+    fn isSupportedProtocolVersion(version: []const u8) bool {
+        for (protocol.SUPPORTED_VERSIONS) |supported| {
+            if (std.mem.eql(u8, supported, version)) return true;
+        }
+        return false;
+    }
+
     /// Look up a registered session by the id a client presented.
     ///
     /// Callers must hold `sessions_mutex` when other threads may be running.
     fn lookupSession(self: *Self, presented_id: []const u8) ?*Session {
         var key_buf: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
         return self.sessions.get(sessionKey(presented_id, &key_buf));
+    }
+
+    /// Whether an id belonged to a session that has since been terminated.
+    fn wasTerminated(self: *Self, io: std.Io, presented_id: []const u8) bool {
+        self.sessions_mutex.lock(io) catch return false;
+        defer self.sessions_mutex.unlock(io);
+        var key_buf: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+        return self.terminated_sessions.contains(sessionKey(presented_id, &key_buf));
     }
 
     /// Look up a session and pin it so it survives for the caller's request.
@@ -375,9 +410,35 @@ pub const Server = struct {
         if (session.closing and session.refs == 0) self.destroySession(session);
     }
 
+    /// Remember that a registered session id existed, so a later request
+    /// against it is answerable with `410 Gone`.
+    ///
+    /// Bounded by `max_sessions`: the oldest tombstone is evicted, which at
+    /// worst degrades an old id back to `404`.
+    fn recordTerminated(self: *Self, key: []const u8) void {
+        if (self.terminated_sessions.contains(key)) return;
+        const owned = self.allocator.dupe(u8, key) catch return;
+        self.terminated_sessions.put(owned, {}) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.terminated_order.append(self.allocator, owned) catch {
+            _ = self.terminated_sessions.remove(owned);
+            self.allocator.free(owned);
+            return;
+        };
+        if (self.terminated_order.items.len > self.max_sessions) {
+            const oldest = self.terminated_order.orderedRemove(0);
+            _ = self.terminated_sessions.remove(oldest);
+            self.allocator.free(oldest);
+        }
+    }
+
     /// Tear a session down, removing it from the table if it was registered.
     fn destroySession(self: *Self, session: *Session) void {
-        if (session.id) |key| _ = self.sessions.remove(key);
+        if (session.id) |key| {
+            if (self.sessions.remove(key)) self.recordTerminated(key);
+        }
         session.deinit(self.allocator);
         self.allocator.destroy(session);
     }
@@ -400,7 +461,9 @@ pub const Server = struct {
             // holding it performs the teardown when it finishes.
             if (session.refs > 0) {
                 session.closing = true;
+                session.cancel_requested = true;
                 _ = self.sessions.remove(session.id.?);
+                self.recordTerminated(session.id.?);
                 continue;
             }
             self.destroySession(session);
@@ -858,24 +921,42 @@ pub const Server = struct {
     /// Without this a client has no way to release its state early and the
     /// table only drains on the idle sweep.
     fn handleHttpSessionDelete(self: *Self, io: std.Io, request: *http.Server.Request) !void {
+        var deleted_session_id: ?[]const u8 = null;
         var header_it = http.HeaderIterator.init(request.head_buffer);
         while (header_it.next()) |header| {
             if (!std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) continue;
+            deleted_session_id = header.value;
             self.sessions_mutex.lock(io) catch return error.Canceled;
             const session = self.lookupSession(header.value) orelse {
                 self.sessions_mutex.unlock(io);
                 break;
             };
-            if (session.refs > 0) {
+            const draining = session.refs > 0;
+            if (draining) {
                 // Still in use: unpublish now, tear down on last release.
                 session.closing = true;
+                session.cancel_requested = true;
                 _ = self.sessions.remove(session.id.?);
+                self.recordTerminated(session.id.?);
             } else {
                 self.destroySession(session);
             }
             self.sessions_mutex.unlock(io);
-            try request.respond("", .{ .status = .no_content });
+            // `202` says the session is gone as far as the client is concerned
+            // but work is still unwinding; `204` says it is fully torn down.
+            try request.respond("", .{ .status = if (draining) .accepted else .no_content });
             return;
+        }
+        if (deleted_session_id) |sid| {
+            if (self.wasTerminated(io, sid)) {
+                try request.respond("MCP session terminated; re-initialize", .{
+                    .status = .gone,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/plain" },
+                    },
+                });
+                return;
+            }
         }
         try request.respond("Unknown or expired MCP session", .{
             .status = .not_found,
@@ -963,6 +1044,7 @@ pub const Server = struct {
     fn handleHttpJsonRpcRequest(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: *http.Server.Request) !void {
         var wants_sse = false;
         var provided_session_id: ?[]const u8 = null;
+        var protocol_version: ?[]const u8 = null;
         var header_it = http.HeaderIterator.init(request.head_buffer);
         while (header_it.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "accept")) {
@@ -971,8 +1053,26 @@ pub const Server = struct {
                 }
             } else if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) {
                 provided_session_id = header.value;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "mcp-protocol-version")) {
+                protocol_version = header.value;
             }
         }
+
+        // Absent means the client predates the header, which the spec says to
+        // read as 2025-03-26. Present but unsupported is a client error: a
+        // client could otherwise negotiate one version at `initialize` and then
+        // speak whatever it liked.
+        const negotiated_version = protocol_version orelse protocol.SUPPORTED_VERSIONS[2];
+        if (protocol_version != null and !isSupportedProtocolVersion(negotiated_version)) {
+            try request.respond("Unsupported MCP-Protocol-Version", .{
+                .status = .bad_request,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/plain" },
+                },
+            });
+            return;
+        }
+
         var session: *Session = undefined;
         // Pinned for the rest of the request so a concurrent idle sweep or
         // `DELETE` cannot free it while this connection is still using it.
@@ -980,6 +1080,15 @@ pub const Server = struct {
         defer if (acquired) |a| self.releaseSession(io, a);
         if (provided_session_id) |sid| {
             session = self.acquireSession(io, sid) orelse {
+                if (self.wasTerminated(io, sid)) {
+                    try request.respond("MCP session terminated; re-initialize", .{
+                        .status = .gone,
+                        .extra_headers = &.{
+                            .{ .name = "Content-Type", .value = "text/plain" },
+                        },
+                    });
+                    return;
+                }
                 try request.respond("Unknown or expired MCP session", .{
                     .status = .not_found,
                     .extra_headers = &.{
@@ -992,34 +1101,20 @@ pub const Server = struct {
             session.last_seen_s = nowSeconds(io);
         }
 
-        const content_length = request.head.content_length orelse {
-            try request.respond("Content-Length required", .{
-                .status = .bad_request,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/plain" },
-                },
-            });
-            return;
-        };
-
-        if (content_length == 0) {
-            try request.respond("Empty JSON-RPC payload", .{
-                .status = .bad_request,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/plain" },
-                },
-            });
-            return;
-        }
-
-        if (content_length > max_http_body_size) {
-            try request.respond("Request body too large", .{
-                .status = .bad_request,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/plain" },
-                },
-            });
-            return;
+        // `Content-Length` is absent for a chunked body, which is legal
+        // HTTP/1.1 and is what a client emits when it streams a message it has
+        // not fully buffered. The size cap is enforced on bytes actually read,
+        // so a declared length is an early reject rather than the only check.
+        if (request.head.content_length) |declared| {
+            if (declared > max_http_body_size) {
+                try request.respond("Request body too large", .{
+                    .status = .payload_too_large,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/plain" },
+                    },
+                });
+                return;
+            }
         }
 
         var read_buffer: [2048]u8 = undefined;
@@ -1033,17 +1128,9 @@ pub const Server = struct {
             return;
         };
 
-        const read_len = std.math.cast(usize, content_length) orelse {
-            try request.respond("Request body too large", .{
-                .status = .bad_request,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/plain" },
-                },
-            });
-            return;
-        };
-
-        const body_items = body_reader.readAlloc(allocator, read_len) catch {
+        // One over the cap, so a body that exceeds it is detectable rather
+        // than silently truncated into a parse error.
+        const body_items = body_reader.readAlloc(allocator, max_http_body_size + 1) catch {
             try request.respond("Failed to read request body", .{
                 .status = .bad_request,
                 .extra_headers = &.{
@@ -1053,6 +1140,26 @@ pub const Server = struct {
             return;
         };
         defer allocator.free(body_items);
+
+        if (body_items.len > max_http_body_size) {
+            try request.respond("Request body too large", .{
+                .status = .payload_too_large,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/plain" },
+                },
+            });
+            return;
+        }
+
+        if (body_items.len == 0) {
+            try request.respond("Empty JSON-RPC payload", .{
+                .status = .bad_request,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/plain" },
+                },
+            });
+            return;
+        }
 
         // A request that arrives without a session id is only meaningful if it
         // is `initialize`. Rather than pre-parsing the body, serve it with an
@@ -1129,12 +1236,15 @@ pub const Server = struct {
             }
         }
 
-        var header_buf: [2]http.Header = undefined;
+        // Echoing the version lets a client detect a mismatched or intercepting
+        // endpoint rather than discovering it through malformed payloads.
+        var header_buf: [3]http.Header = undefined;
         header_buf[0] = .{ .name = "Content-Type", .value = "application/json" };
-        var header_len: usize = 1;
+        header_buf[1] = .{ .name = "MCP-Protocol-Version", .value = negotiated_version };
+        var header_len: usize = 2;
         if (emit_session_id) |sid| {
-            header_buf[1] = .{ .name = "Mcp-Session-Id", .value = sid };
-            header_len = 2;
+            header_buf[2] = .{ .name = "Mcp-Session-Id", .value = sid };
+            header_len = 3;
         }
 
         if (request_transport.response_message) |response_json| {
@@ -3001,4 +3111,82 @@ test "connection timeouts are applied to accepted sockets" {
     try std.testing.expect(Server.setSocketTimeouts(listener.socket.handle, 7));
     // Disabled means disabled: no option is set at all.
     try std.testing.expect(!Server.setSocketTimeouts(listener.socket.handle, 0));
+}
+
+test "MCP-Protocol-Version is validated against the supported set" {
+    for (protocol.SUPPORTED_VERSIONS) |version| {
+        try std.testing.expect(Server.isSupportedProtocolVersion(version));
+    }
+    try std.testing.expect(!Server.isSupportedProtocolVersion("2199-01-01"));
+    try std.testing.expect(!Server.isSupportedProtocolVersion(""));
+}
+
+test "a terminated session id is remembered so it can be answered 410" {
+    // A destroyed session and a fabricated id used to be indistinguishable;
+    // both got 404, so a client could not tell "re-initialize" from "wrong id".
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const created = try server.createSession(io);
+    const plaintext = created.plaintext_id;
+    defer std.testing.allocator.free(plaintext);
+    try server.sessions.put(created.session.id.?, created.session);
+
+    try std.testing.expect(!server.wasTerminated(io, plaintext));
+    server.destroySession(created.session);
+    try std.testing.expect(server.wasTerminated(io, plaintext));
+    try std.testing.expect(!server.wasTerminated(io, "never-existed"));
+}
+
+test "terminated session ids are bounded" {
+    // The tombstone table must not become an unbounded memory sink for a
+    // server that churns sessions.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+    server.max_sessions = 4;
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const created = try server.createSession(io);
+        std.testing.allocator.free(created.plaintext_id);
+        try server.sessions.put(created.session.id.?, created.session);
+        server.destroySession(created.session);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), server.terminated_order.items.len);
+    try std.testing.expectEqual(@as(usize, 4), server.terminated_sessions.count());
+}
+
+test "retiring a busy session asks its in-flight work to stop" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
+    defer server.deinit();
+
+    const created = try server.createSession(io);
+    defer std.testing.allocator.free(created.plaintext_id);
+    try server.sessions.put(created.session.id.?, created.session);
+
+    const session = server.acquireSession(io, created.plaintext_id).?;
+    try std.testing.expect(!session.isCancelled());
+
+    session.last_seen_s = 0;
+    server.sweepIdleSessions(io);
+
+    // The handler still holds the session, but is now told its result has
+    // nowhere to go.
+    try std.testing.expect(session.isCancelled());
+    try std.testing.expect(server.wasTerminated(io, created.plaintext_id));
+
+    server.releaseSession(io, session);
 }
