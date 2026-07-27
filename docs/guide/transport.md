@@ -207,9 +207,39 @@ const MyTransport = struct {
 
 ### STDIO Options
 
+`StdioTransport` is a plain struct with defaults, so it is constructed with
+`.{}` and configured by setting fields:
+
 ```zig
-const stdio_transport = mcp.transport.StdioTransport.init(allocator);
+var stdio_transport: mcp.transport.StdioTransport = .{};
+defer stdio_transport.deinit(allocator);
 ```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `in` | `null` (this process's stdin) | Stream to read messages from |
+| `out` | `null` (this process's stdout) | Stream to write messages to |
+| `max_message_size` | 4 MiB | Largest single message accepted; a longer one fails with `MessageTooLarge` |
+
+The defaults are what a **server** wants: it is spawned with its standard
+streams already wired to its parent. A **client** that spawns a server must
+instead point `in` at the child's stdout and `out` at the child's stdin:
+
+```zig
+var child = try std.process.spawn(io, .{
+    .argv = argv,
+    .stdin = .pipe,
+    .stdout = .pipe,
+});
+var stdio_transport: mcp.transport.StdioTransport = .{
+    .in = child.stdout.?,
+    .out = child.stdin.?,
+};
+```
+
+Messages are newline-delimited, and reads are buffered, so `receive` may pull
+more than one message off the stream in a single syscall. The extra bytes are
+retained and returned by the following `receive` calls.
 
 ### HTTP Options
 
