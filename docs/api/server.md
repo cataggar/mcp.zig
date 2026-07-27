@@ -35,7 +35,12 @@ Run options:
 | `.stdio` | Line-delimited JSON-RPC over stdin/stdout |
 | `.{ .http = .{ .host = "localhost", .port = 8080 } }` | HTTP listener with JSON-RPC POST on `/` |
 
-Note: HTTP mode accepts host names such as `localhost` and binds to loopback when appropriate.
+Note: HTTP mode binds loopback by default. Binding any other address requires
+`.allow_non_loopback = true` **and** an `.auth_token` of at least 32
+characters; otherwise `run` fails with `NonLoopbackBindRequiresOptIn` or
+`NonLoopbackBindRequiresAuthToken` before the listener is created. When
+`auth_token` is set, every request must present `Authorization: Bearer <token>`
+or receive `401`.
 
 ## Registration
 

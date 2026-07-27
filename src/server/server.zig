@@ -217,7 +217,81 @@ pub const Server = struct {
     pub const HttpRunConfig = struct {
         port: u16 = 8080,
         host: []const u8 = "localhost",
+
+        /// Bearer token that every request must present in `Authorization`.
+        ///
+        /// May be left null for a loopback bind, where the operating system
+        /// already limits reachability to processes on this machine. It is
+        /// mandatory for any other bind.
+        auth_token: ?[]const u8 = null,
+
+        /// Opt in to binding an address reachable from outside this machine.
+        ///
+        /// Defaults to false, and deliberately so: an MCP server exposes every
+        /// registered tool, so binding a routable interface by accident hands
+        /// those tools to whoever can reach the port. Setting this also
+        /// requires `auth_token`.
+        allow_non_loopback: bool = false,
+
+        /// Shortest accepted token. Long enough that an online guessing attack
+        /// against a high-entropy token is not worth attempting.
+        pub const min_auth_token_len = 32;
+
+        pub const ValidateError = error{
+            NonLoopbackBindRequiresOptIn,
+            NonLoopbackBindRequiresAuthToken,
+            AuthTokenTooShort,
+        };
+
+        /// Rejects configurations that would expose tools without
+        /// authentication. Called by `runHttp` before the listener is created,
+        /// so a misconfigured server refuses to start rather than starting
+        /// insecurely.
+        pub fn validate(config: HttpRunConfig) ValidateError!void {
+            if (config.auth_token) |token| {
+                if (token.len < min_auth_token_len) return error.AuthTokenTooShort;
+            }
+
+            if (isLoopbackHost(config.host)) return;
+
+            if (!config.allow_non_loopback) return error.NonLoopbackBindRequiresOptIn;
+            if (config.auth_token == null) return error.NonLoopbackBindRequiresAuthToken;
+        }
     };
+
+    /// Whether `host` names an address that only this machine can reach.
+    ///
+    /// Fails closed: anything that cannot be shown to be loopback, including
+    /// names this function cannot resolve without doing I/O, is treated as
+    /// routable. That is the safe direction to be wrong in, because the only
+    /// consequence is that the operator must set `allow_non_loopback`.
+    fn isLoopbackHost(host: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+
+        const trimmed = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+            host[1 .. host.len - 1]
+        else
+            host;
+
+        if (std.Io.net.Ip4Address.parse(trimmed, 0)) |ip4| {
+            // The whole of 127.0.0.0/8 is loopback, not just 127.0.0.1.
+            return ip4.bytes[0] == 127;
+        } else |_| {}
+
+        if (std.Io.net.Ip6Address.parse(trimmed, 0)) |ip6| {
+            const loopback6 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+            if (std.mem.eql(u8, &ip6.bytes, &loopback6)) return true;
+
+            // ::ffff:127.0.0.0/8, the IPv4-mapped form of loopback.
+            const v4_mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            if (std.mem.startsWith(u8, &ip6.bytes, &v4_mapped_prefix)) {
+                return ip6.bytes[12] == 127;
+            }
+            return false;
+        } else |_| {}
+
+        return false;
+    }
 
     pub const RunOptions = union(enum) {
         stdio: void,
@@ -242,6 +316,8 @@ pub const Server = struct {
     }
 
     fn runHttp(self: *Self, io: std.Io, allocator: std.mem.Allocator, config: HttpRunConfig) !void {
+        try config.validate();
+
         const bind_host = if (std.mem.eql(u8, config.host, "localhost")) "127.0.0.1" else config.host;
 
         const address = std.Io.net.IpAddress.resolve(io, bind_host, config.port) catch {
@@ -257,13 +333,13 @@ pub const Server = struct {
                 continue;
             };
 
-            self.serveHttpConnection(io, allocator, stream) catch |err| {
+            self.serveHttpConnection(io, allocator, stream, config) catch |err| {
                 std.log.err("HTTP connection error: {s}", .{@errorName(err)});
             };
         }
     }
 
-    fn serveHttpConnection(self: *Self, io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream) !void {
+    fn serveHttpConnection(self: *Self, io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, config: HttpRunConfig) !void {
         defer stream.close(io);
 
         var send_buffer: [4096]u8 = undefined;
@@ -287,7 +363,55 @@ pub const Server = struct {
             return;
         }
 
+        // Authenticate before reading the body, so an unauthenticated peer
+        // cannot make the server allocate for it.
+        if (config.auth_token) |expected| {
+            if (!requestIsAuthorized(&request, expected)) {
+                try request.respond("Unauthorized", .{
+                    .status = .unauthorized,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/plain" },
+                        .{ .name = "WWW-Authenticate", .value = "Bearer" },
+                    },
+                });
+                return;
+            }
+        }
+
         try self.handleHttpJsonRpcRequest(io, allocator, &request);
+    }
+
+    /// Whether the request carries `Authorization: Bearer <expected>`.
+    ///
+    /// The comparison hashes both sides and compares the digests in constant
+    /// time. Comparing the tokens directly would leak how long a shared prefix
+    /// the attacker guessed, and comparing lengths first would leak the token
+    /// length; hashing to a fixed 32 bytes avoids both.
+    fn requestIsAuthorized(request: *http.Server.Request, expected: []const u8) bool {
+        const prefix = "Bearer ";
+
+        var presented: ?[]const u8 = null;
+        var header_it = http.HeaderIterator.init(request.head_buffer);
+        while (header_it.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "authorization")) continue;
+            if (header.value.len <= prefix.len) continue;
+            if (!std.ascii.startsWithIgnoreCase(header.value, prefix)) continue;
+            presented = header.value[prefix.len..];
+            break;
+        }
+
+        const token = presented orelse return false;
+
+        var presented_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        var expected_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(token, &presented_digest, .{});
+        std.crypto.hash.sha2.Sha256.hash(expected, &expected_digest, .{});
+
+        return std.crypto.timing_safe.eql(
+            [std.crypto.hash.sha2.Sha256.digest_length]u8,
+            presented_digest,
+            expected_digest,
+        );
     }
 
     fn handleHttpJsonRpcRequest(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: *http.Server.Request) !void {
@@ -1714,4 +1838,96 @@ test "HttpRequestTransport replaces an earlier response without leaking" {
     arena.deinit();
 
     try std.testing.expectEqualStrings("second", request_transport.response_message.?);
+}
+
+test "isLoopbackHost recognises loopback forms" {
+    const loopback = [_][]const u8{
+        "localhost",
+        "LOCALHOST",
+        "127.0.0.1",
+        // The whole of 127.0.0.0/8 is loopback, not just .0.1.
+        "127.0.0.2",
+        "127.1.2.3",
+        "127.255.255.254",
+        "::1",
+        "[::1]",
+        // IPv4-mapped loopback.
+        "::ffff:127.0.0.1",
+    };
+    for (loopback) |host| {
+        try std.testing.expect(Server.isLoopbackHost(host));
+    }
+}
+
+test "isLoopbackHost treats routable and unknown hosts as non-loopback" {
+    const routable = [_][]const u8{
+        // Wildcard binds are reachable from off-machine.
+        "0.0.0.0",
+        "::",
+        "[::]",
+        "192.168.1.10",
+        "10.0.0.1",
+        "8.8.8.8",
+        // 128.x is deliberately adjacent to 127.x.
+        "128.0.0.1",
+        "126.255.255.255",
+        "::ffff:8.8.8.8",
+        "example.com",
+        // Anything unparseable must fail closed.
+        "",
+        "not a host",
+        "localhost.evil.com",
+    };
+    for (routable) |host| {
+        try std.testing.expect(!Server.isLoopbackHost(host));
+    }
+}
+
+test "HttpRunConfig allows an unauthenticated loopback bind" {
+    // The default configuration must keep working without ceremony.
+    try (Server.HttpRunConfig{}).validate();
+    try (Server.HttpRunConfig{ .host = "127.0.0.1" }).validate();
+    try (Server.HttpRunConfig{ .host = "::1" }).validate();
+}
+
+test "HttpRunConfig requires opt-in for a non-loopback bind" {
+    try std.testing.expectError(
+        error.NonLoopbackBindRequiresOptIn,
+        (Server.HttpRunConfig{ .host = "0.0.0.0" }).validate(),
+    );
+    try std.testing.expectError(
+        error.NonLoopbackBindRequiresOptIn,
+        (Server.HttpRunConfig{ .host = "0.0.0.0", .auth_token = "x" ** 32 }).validate(),
+    );
+}
+
+test "HttpRunConfig requires a token once a non-loopback bind is opted into" {
+    try std.testing.expectError(
+        error.NonLoopbackBindRequiresAuthToken,
+        (Server.HttpRunConfig{ .host = "0.0.0.0", .allow_non_loopback = true }).validate(),
+    );
+
+    // Opted in and authenticated is the one accepted combination.
+    try (Server.HttpRunConfig{
+        .host = "0.0.0.0",
+        .allow_non_loopback = true,
+        .auth_token = "x" ** 32,
+    }).validate();
+}
+
+test "HttpRunConfig rejects a short token even on loopback" {
+    // A weak token is worse than none, because it invites reliance on it.
+    try std.testing.expectError(
+        error.AuthTokenTooShort,
+        (Server.HttpRunConfig{ .auth_token = "short" }).validate(),
+    );
+    try std.testing.expectError(
+        error.AuthTokenTooShort,
+        (Server.HttpRunConfig{
+            .host = "0.0.0.0",
+            .allow_non_loopback = true,
+            .auth_token = "x" ** 31,
+        }).validate(),
+    );
+    try (Server.HttpRunConfig{ .auth_token = "x" ** 32 }).validate();
 }

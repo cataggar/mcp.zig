@@ -45,15 +45,34 @@ For remote MCP servers or web-based integration.
 
 ### Server Side
 
+Loopback binds need no ceremony:
+
 ```zig
 try server.run(io, allocator, .{ .http = .{ .port = 8080 } });
 ```
 
-Custom host/domain and port:
+Exposing the server beyond this machine is opt-in and requires a token:
 
 ```zig
-try server.run(io, allocator, .{ .http = .{ .host = "api.example.com", .port = 8443 } });
+try server.run(io, allocator, .{ .http = .{
+    .host = "0.0.0.0",
+    .port = 8443,
+    .allow_non_loopback = true,
+    .auth_token = my_secret, // at least 32 characters
+} });
 ```
+
+| Field | Default | Meaning |
+| ----- | ------- | ------- |
+| `host` | `"localhost"` | Address to bind. Loopback forms (`localhost`, `127.0.0.0/8`, `::1`) need no opt-in. |
+| `allow_non_loopback` | `false` | Required to bind any other address. |
+| `auth_token` | `null` | Bearer token required on every request. Mandatory for non-loopback binds; minimum 32 characters. |
+
+When `auth_token` is set, every request must carry
+`Authorization: Bearer <token>`; anything else is answered with `401` before
+the body is read. The configuration is validated before the listener is
+created, so a server that would expose tools without authentication refuses to
+start.
 
 ### Client Side
 
