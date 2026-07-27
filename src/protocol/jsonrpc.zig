@@ -116,6 +116,10 @@ pub const ErrorCode = struct {
     pub const SERVER_NOT_INITIALIZED: i32 = -32002;
     pub const REQUEST_CANCELLED: i32 = -32800;
     pub const CONTENT_TOO_LARGE: i32 = -32801;
+    /// Implementation-defined (the -32000..-32099 range JSON-RPC reserves for
+    /// servers): every worker is busy, so the call was refused rather than
+    /// queued behind work the client cannot see.
+    pub const SERVER_BUSY: i32 = -32000;
 };
 
 /// Errors that can occur during message parsing.

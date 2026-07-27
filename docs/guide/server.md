@@ -26,6 +26,7 @@ defer server.deinit();
 | websiteUrl | ?[]const u8 | Optional website URL |
 | instructions | ?[]const u8 | Optional server usage instructions |
 | page_size | usize | Maximum items per `*/list` response. `0` (default) returns everything in one page. |
+| max_tool_workers | usize | Threads that run `tools/call` off the message loop. `0` (default) keeps the loop strictly sequential. |
 
 ### Pagination
 
@@ -43,6 +44,47 @@ Cursors are opaque (base64url of an internal key). One the server never issued
 is answered with `-32602 Invalid cursor`; it does not drop the connection.
 
 `page_size = 0` is the historical behaviour and never emits `nextCursor`.
+
+### Concurrent tool calls
+
+By default the message loop is strictly sequential: a tool that takes ten
+seconds to answer stalls every request behind it, including `ping` and
+`notifications/cancelled`. Setting `max_tool_workers` starts that many threads
+and routes `tools/call` requests to them:
+
+```zig
+var server = mcp.Server.init(allocator, .{
+    .name = "my-server",
+    .version = "1.0.0",
+    .max_tool_workers = 4,
+});
+```
+
+Only `tools/call` is moved off the loop. Everything else — the handshake,
+`ping`, cancellations — is still handled inline, so ordering during
+initialization is preserved and a cancellation never queues up behind the call
+it is meant to stop.
+
+Admission is bounded rather than queued. When every worker is occupied the
+next tool call is answered immediately with `-32000 Server busy` instead of
+waiting in a queue the client cannot see:
+
+```json
+{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"Server busy",
+ "data":"all tool workers are occupied"}}
+```
+
+A client that gets this should retry; it means the server is saturated, not
+that the request was wrong. Pick `max_tool_workers` to match how many tool
+invocations you are willing to have running at once — an unbounded pool would
+just move the failure from a clear error into memory exhaustion.
+
+Writes to the transport are serialized, so replies from workers never
+interleave with each other or with the loop. Responses may of course arrive
+out of request order; JSON-RPC ids are what pair a response to its request.
+
+Combine this with [contextual tool handlers](tools.md) so a long-running tool
+can also be cancelled while it runs.
 
 ## Capabilities
 
