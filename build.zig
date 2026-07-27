@@ -94,8 +94,21 @@ pub fn build(b: *std.Build) void {
 
     // The client tests spawn a real server over stdio, so they need to know
     // where its binary landed.
+    const probe_mod = b.createModule(.{
+        .root_source_file = b.path("test/env_probe_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    probe_mod.addImport("mcp", mcp_module);
+    const env_probe_exe = b.addExecutable(.{
+        .name = "env-probe-server",
+        .root_module = probe_mod,
+    });
+
     const test_options = b.addOptions();
     test_options.addOptionPath("example_server_path", example_server_exe.?.getEmittedBin());
+    test_options.addOptionPath("env_probe_server_path", env_probe_exe.getEmittedBin());
     test_mod.addOptions("build_options", test_options);
     unit_tests.step.dependOn(&example_server_exe.?.step);
+    unit_tests.step.dependOn(&env_probe_exe.step);
 }
