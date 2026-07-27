@@ -224,7 +224,12 @@ fn parseErrorResponse(obj: std.json.ObjectMap) !ErrorResponse {
 
     const err = error_obj.object;
     const code = if (err.get("code")) |c| switch (c) {
-        .integer => @as(i32, @intCast(c.integer)),
+        // std.json parses integers as i64, so a peer can supply a value that
+        // does not fit in i32. An unchecked @intCast would panic in safe
+        // builds and silently truncate in ReleaseFast; treat it as a
+        // malformed message instead, which the caller already turns into a
+        // proper JSON-RPC parse error.
+        .integer => std.math.cast(i32, c.integer) orelse return error.InvalidMessage,
         else => return error.InvalidMessage,
     } else return error.InvalidMessage;
 
@@ -626,4 +631,39 @@ test "serializer escapes backslashes" {
     var parsed = try expectReparses(json);
     defer parsed.deinit();
     try std.testing.expectEqualStrings(hostile, parsed.value.object.get("id").?.string);
+}
+
+test "out-of-range error codes are rejected rather than crashing" {
+    // std.json parses integers as i64, so a peer can send a code outside the
+    // i32 range. This used to reach an unchecked @intCast and abort the
+    // process from any connection, before initialize.
+    const cases = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":9999999999,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-9999999999,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":9223372036854775807,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-9223372036854775808,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":2147483648,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-2147483649,\"message\":\"x\"}}",
+    };
+
+    for (cases) |json| {
+        try std.testing.expectError(
+            ParseError.InvalidMessage,
+            parseMessage(std.testing.allocator, json),
+        );
+    }
+}
+
+test "in-range error codes still parse, including i32 boundaries" {
+    const cases = [_]struct { json: []const u8, code: i32 }{
+        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"x\"}}", .code = -32600 },
+        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":2147483647,\"message\":\"x\"}}", .code = 2147483647 },
+        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-2147483648,\"message\":\"x\"}}", .code = -2147483648 },
+    };
+
+    for (cases) |case| {
+        var parsed = try parseMessage(std.testing.allocator, case.json);
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.code, parsed.message.error_response.@"error".code);
+    }
 }
