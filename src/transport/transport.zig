@@ -717,8 +717,20 @@ test "Client.connectHttp round-trips and frees everything it allocates" {
     var listener = try bindTestListener(io, 39300, &port);
     defer listener.deinit(io);
 
-    const init_result = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nmcp-session-id: issued-session\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}";
-    const replies = [_][]const u8{ init_result, init_result };
+    // A real handshake reply: `connectHttp` now validates the negotiated
+    // version instead of discarding the response.
+    const init_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"srv\",\"version\":\"9.9\"}}}";
+    const tools_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\"}]}}";
+
+    var init_reply_buf: [512]u8 = undefined;
+    var tools_reply_buf: [512]u8 = undefined;
+    const init_reply = try std.fmt.bufPrint(&init_reply_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nmcp-session-id: issued-session\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ init_body.len, init_body });
+    const tools_reply = try std.fmt.bufPrint(&tools_reply_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ tools_body.len, tools_body });
+    // The middle reply answers `notifications/initialized`, which the
+    // handshake now sends; an empty body must not be mistaken for a response.
+    const accepted = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    const replies = [_][]const u8{ init_reply, accepted, tools_reply };
     var origin: TestHttpOrigin = .{
         .listener = &listener,
         .replies = &replies,
@@ -733,14 +745,23 @@ test "Client.connectHttp round-trips and frees everything it allocates" {
     defer allocator.free(endpoint);
 
     var client: client_mod.Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
-    defer client.deinit(allocator);
+    defer client.deinit(io, allocator);
 
     try client.connectHttp(io, allocator, endpoint);
-    try client.listTools(io, allocator);
+    try std.testing.expectEqualStrings("2025-11-25", client.negotiated_version.?);
+    try std.testing.expect(client.serverCapabilities() != null);
 
-    try std.testing.expectEqual(@as(usize, 2), origin.requestCount());
-    // The handshake response carried a session id; the next request replays it.
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[1], "mcp-session-id: issued-session") != null);
+    const tools = try client.listTools(io, allocator);
+    defer tools.deinit();
+
+    // The result actually reached the caller, rather than being dropped.
+    const list = tools.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqualStrings("echo", list.items[0].object.get("name").?.string);
+
+    try std.testing.expectEqual(@as(usize, 3), origin.requestCount());
+    // The handshake response carried a session id; later requests replay it.
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[2], "mcp-session-id: issued-session") != null);
 }
 
 fn stdioFromFixture(dir: std.Io.Dir, io: std.Io, name: []const u8, contents: []const u8) !std.Io.File {

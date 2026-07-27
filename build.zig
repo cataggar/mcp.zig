@@ -66,6 +66,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http-server", .src = "examples/http_server.zig", .run_step = "run-http", .desc = "Run the HTTP server example" },
     };
 
+    var example_server_exe: ?*std.Build.Step.Compile = null;
+
     inline for (examples) |ex| {
         const mod = b.createModule(.{
             .root_source_file = b.path(ex.src),
@@ -86,5 +88,14 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step(ex.run_step, ex.desc);
         run_step.dependOn(&run_artifact.step);
         all_step.dependOn(&exe.step);
+
+        if (comptime std.mem.eql(u8, ex.name, "example-server")) example_server_exe = exe;
     }
+
+    // The client tests spawn a real server over stdio, so they need to know
+    // where its binary landed.
+    const test_options = b.addOptions();
+    test_options.addOptionPath("example_server_path", example_server_exe.?.getEmittedBin());
+    test_mod.addOptions("build_options", test_options);
+    unit_tests.step.dependOn(&example_server_exe.?.step);
 }

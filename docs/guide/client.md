@@ -11,7 +11,7 @@ var client: mcp.Client = .init(io, allocator, .{
     .name = "my-client",
     .version = "1.0.0",
 });
-defer client.deinit(allocator);
+defer client.deinit(io, allocator);
 ```
 
 ## Configuration
@@ -58,16 +58,27 @@ client.enableSampling();
 ### List Available Tools
 
 ```zig
-try client.listTools(io, allocator);
+const tools = try client.listTools(io, allocator);
+defer tools.deinit();
+
+for (tools.get("tools").?.array.items) |tool| {
+    std.debug.print("{s}\n", .{tool.object.get("name").?.string});
+}
 ```
 
 ### Call a Tool
 
 ```zig
-var args: std.json.ObjectMap = .empty;
-try args.put(allocator, "name", .{ .string = "World" });
+var arena = std.heap.ArenaAllocator.init(allocator);
+defer arena.deinit();
 
-try client.callTool(io, allocator, "greet", .{ .object = args });
+var args: std.json.ObjectMap = .empty;
+try args.put(arena.allocator(), "name", .{ .string = "World" });
+
+const result = try client.callTool(io, allocator, "greet", .{ .object = args });
+defer result.deinit();
+
+const text = result.get("content").?.array.items[0].object.get("text").?.string;
 ```
 
 ## Using Resources
@@ -98,34 +109,42 @@ try client.listPrompts(io, allocator);
 var args: std.json.ObjectMap = .empty;
 try args.put(allocator, "topic", .{ .string = "Zig programming" });
 
-try client.getPrompt(io, allocator, "summarize", .{ .object = args });
+const prompt = try client.getPrompt(io, allocator, "summarize", .{ .object = args });
+defer prompt.deinit();
 ```
 
 ## Handling Responses
 
-All request APIs send JSON-RPC messages and return `!void`. To read responses,
-use the underlying transport and parse the incoming messages:
+Request methods return a `Response`. `result` is the JSON-RPC `result` member,
+and it lives in the response's arena, so it is valid until `deinit`.
 
 ```zig
-try client.listTools(io, allocator);
+const tools = try client.listTools(io, allocator);
+defer tools.deinit();
 
-if (client.transport) |t| {
-    if (try t.receive(io, allocator)) |json| {
-        const parsed = try mcp.jsonrpc.parseMessage(allocator, json);
-        defer parsed.deinit();
-
-        switch (parsed.message) {
-            .response => |resp| {
-                std.debug.print("Response: {any}\n", .{resp.result});
-            },
-            .error_response => |err| {
-                std.debug.print("Error: {s}\n", .{err.@"error".message});
-            },
-            else => {},
-        }
-    }
-}
+// `get` reads a field of the result object.
+const list = tools.get("tools") orelse return error.MissingTools;
+for (list.array.items) |tool| { ... }
 ```
+
+If the server replies with a JSON-RPC error, the call returns
+`error.ServerError` and the details are on the client:
+
+```zig
+const result = client.callTool(io, allocator, "greet", null) catch |err| switch (err) {
+    error.ServerError => {
+        const e = client.last_error.?;
+        std.debug.print("server said {d}: {s}\n", .{ e.code, e.message });
+        return;
+    },
+    else => return err,
+};
+defer result.deinit();
+```
+
+Messages that are not the awaited response are currently discarded, so
+server-initiated requests (sampling, elicitation, `roots/list`) are not yet
+answered.
 
 ## Managing Roots
 
@@ -155,7 +174,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator) !void {
         .name = "demo-client",
         .version = "1.0.0",
     });
-    defer client.deinit(allocator);
+    defer client.deinit(io, allocator);
 
     // Enable capabilities
     client.enableRoots(true);
@@ -168,11 +187,13 @@ fn run(io: std.Io, allocator: std.mem.Allocator) !void {
 
     // List and call tools
     const tools = try client.listTools(io, allocator);
-    std.debug.print("Available tools: {d}\n", .{tools.len});
+    defer tools.deinit();
+    std.debug.print("Available tools: {d}\n", .{tools.get("tools").?.array.items.len});
 
     // Call a tool
     const result = try client.callTool(io, allocator, "hello", null);
-    std.debug.print("Result: {any}\n", .{result});
+    defer result.deinit();
+    std.debug.print("Result: {f}\n", .{std.json.fmt(result.result, .{})});
 }
 ```
 

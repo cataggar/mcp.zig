@@ -25,7 +25,46 @@ pub const ClientConfig = struct {
     /// mcp.zig. Off by default: constructing a client must not contact a
     /// third-party host the caller never asked to reach.
     check_for_updates: bool = false,
+    /// What to do with a spawned server's stderr.
+    ///
+    /// Defaults to discarding it. MCP servers commonly log there, and
+    /// inheriting mixes that into the host application's own stderr -- which
+    /// corrupts anything structured the host writes. `.pipe` is deliberately
+    /// not the default: nothing drains it, so a chatty server would fill the
+    /// pipe buffer and block forever.
+    server_stderr: std.process.SpawnOptions.StdIo = .ignore,
 };
+
+/// A successful JSON-RPC response.
+///
+/// `result` is a view into `parsed`, so it is only valid until `deinit`.
+pub const Response = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    result: std.json.Value,
+
+    pub fn deinit(self: Response) void {
+        self.parsed.deinit();
+    }
+
+    /// Looks up a field of the result object, or null if the result is not an
+    /// object or has no such field.
+    pub fn get(self: Response, name: []const u8) ?std.json.Value {
+        return switch (self.result) {
+            .object => |o| o.get(name),
+            else => null,
+        };
+    }
+};
+
+/// A JSON-RPC error returned by the server.
+pub const ServerError = struct {
+    code: i64,
+    message: []const u8,
+};
+
+/// How many consecutive empty reads to tolerate while waiting for a response
+/// before giving up with `error.NoResponse`.
+const max_empty_reads = 128;
 
 /// Connection state of the client.
 pub const ClientState = enum {
@@ -50,6 +89,15 @@ pub const Client = struct {
     pending_requests: std.AutoHashMap(i64, PendingRequest),
     capabilities: types.ClientCapabilities = .{},
     authorization_token: ?[]const u8 = null,
+    /// Server process spawned by `connectStdio`, owned by this client.
+    child: ?std.process.Child = null,
+    /// The `initialize` response, retained so `serverCapabilities` and
+    /// `serverInfo` stay valid for the life of the connection.
+    handshake: ?Response = null,
+    /// Protocol version agreed during the handshake.
+    negotiated_version: ?[]const u8 = null,
+    /// Details of the most recent `error.ServerError`.
+    last_error: ?ServerError = null,
     roots_list: std.ArrayList(types.Root),
     update_thread: ?std.Thread = null,
 
@@ -72,7 +120,7 @@ pub const Client = struct {
     }
 
     /// Releases all resources held by the client.
-    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Self, io: std.Io, allocator: std.mem.Allocator) void {
         self.pending_requests.deinit();
         self.roots_list.deinit(allocator);
         if (self.authorization_token) |token| {
@@ -81,9 +129,20 @@ pub const Client = struct {
         // `connectStdio`/`connectHttp` allocate the transport, so the client
         // owns it. Without this the endpoint, the session id and every queued
         // response leak.
+        if (self.handshake) |h| {
+            h.deinit();
+            self.handshake = null;
+        }
+        self.clearServerError(allocator);
         if (self.transport) |t| {
             t.deinit(allocator);
             self.transport = null;
+        }
+        // The spawned server would otherwise linger as an orphan holding the
+        // pipes open.
+        if (self.child) |*c| {
+            c.kill(io);
+            self.child = null;
         }
         // Join rather than detach. The worker borrows this allocator, so
         // detaching lets it run on past the caller's `gpa.deinit()` and touch
@@ -154,12 +213,29 @@ pub const Client = struct {
 
     /// Connects to a server by spawning a process and communicating via STDIO.
     pub fn connectStdio(self: *Self, io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) !void {
-        _ = args;
-        _ = command;
         self.state = .connecting;
+        errdefer self.state = .error_state;
+
+        const argv = try allocator.alloc([]const u8, args.len + 1);
+        defer allocator.free(argv);
+        argv[0] = command;
+        @memcpy(argv[1..], args);
+
+        var child = try std.process.spawn(io, .{
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = self.config.server_stderr,
+        });
+        errdefer child.kill(io);
 
         const stdio = try allocator.create(transport_mod.StdioTransport);
-        stdio.* = .{};
+        errdefer allocator.destroy(stdio);
+        // Read the server's stdout and write to its stdin. Leaving these at
+        // their defaults would point the client at its own streams.
+        stdio.* = .{ .in = child.stdout.?, .out = child.stdin.? };
+
+        self.child = child;
         self.transport = stdio.transport();
 
         try self.initialize(io, allocator);
@@ -176,6 +252,7 @@ pub const Client = struct {
     /// Connects to a server via HTTP at the specified URL.
     pub fn connectHttp(self: *Self, io: std.Io, allocator: std.mem.Allocator, url: []const u8) !void {
         self.state = .connecting;
+        errdefer self.state = .error_state;
 
         const http = try allocator.create(transport_mod.HttpTransport);
         http.* = try transport_mod.HttpTransport.init(allocator, url);
@@ -283,147 +360,272 @@ pub const Client = struct {
         }
         try params.put(aa, "clientInfo", .{ .object = client_info });
 
-        try self.sendRequest(io, allocator, "initialize", .{ .object = params });
+        var response = try self.request(io, allocator, "initialize", .{ .object = params });
+        errdefer response.deinit();
+
+        // Validate the handshake rather than discarding it: the version the
+        // server picked decides what the rest of the session may use.
+        const version = switch (response.get("protocolVersion") orelse
+            return error.MissingProtocolVersion) {
+            .string => |v| v,
+            else => return error.InvalidResponse,
+        };
+        if (!isSupportedVersion(version)) return error.UnsupportedProtocolVersion;
+
+        self.negotiated_version = version;
+        self.handshake = response;
+        self.state = .connected;
+
+        // The spec requires this before any other request.
+        try self.notifyInitialized(io, allocator);
     }
 
-    /// Sends a JSON-RPC request to the connected server.
-    fn sendRequest(self: *Self, io: std.Io, allocator: std.mem.Allocator, method: []const u8, params: ?std.json.Value) !void {
+    fn isSupportedVersion(version: []const u8) bool {
+        for (protocol.SUPPORTED_VERSIONS) |supported| {
+            if (std.mem.eql(u8, supported, version)) return true;
+        }
+        return false;
+    }
+
+    /// Sends a JSON-RPC request and waits for the matching response.
+    ///
+    /// The caller owns the returned `Response` and must `deinit` it.
+    pub fn request(self: *Self, io: std.Io, allocator: std.mem.Allocator, method: []const u8, params: ?std.json.Value) !Response {
+        const t = self.transport orelse return error.NotConnected;
+
         const id = self.next_request_id;
         self.next_request_id += 1;
 
         try self.pending_requests.put(id, .{ .method = method });
+        errdefer _ = self.pending_requests.remove(id);
 
-        const request = jsonrpc.createRequest(.{ .integer = id }, method, params);
-        const json = try jsonrpc.serializeMessage(allocator, .{ .request = request });
+        const req = jsonrpc.createRequest(.{ .integer = id }, method, params);
+        const json = try jsonrpc.serializeMessage(allocator, .{ .request = req });
         defer allocator.free(json);
 
-        if (self.transport) |t| {
-            t.send(io, allocator, json) catch {
-                std.log.err("Failed to send request", .{});
-                return;
+        try t.send(io, allocator, json);
+
+        const response = try self.awaitResponse(io, allocator, id);
+        _ = self.pending_requests.remove(id);
+        return response;
+    }
+
+    /// Reads from the transport until the response with `id` arrives.
+    ///
+    /// Messages that are not that response are discarded. Server-initiated
+    /// requests (sampling, elicitation, `roots/list`) are therefore not
+    /// answered yet; they need a handler registry.
+    fn awaitResponse(self: *Self, io: std.Io, allocator: std.mem.Allocator, id: i64) !Response {
+        const t = self.transport orelse return error.NotConnected;
+
+        var empty_reads: usize = 0;
+        while (true) {
+            const raw = t.receive(io, allocator) catch |err| switch (err) {
+                error.EndOfStream, error.ConnectionClosed => return error.ConnectionClosed,
+                else => |e| return e,
+            } orelse {
+                // A transport with nothing queued would otherwise spin here
+                // forever waiting for a reply that is never coming.
+                empty_reads += 1;
+                if (empty_reads > max_empty_reads) return error.NoResponse;
+                continue;
             };
+            defer allocator.free(raw);
+            empty_reads = 0;
+
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{
+                .ignore_unknown_fields = true,
+                .allocate = .alloc_always,
+            }) catch return error.InvalidResponse;
+            var keep = false;
+            defer if (!keep) parsed.deinit();
+
+            const obj = switch (parsed.value) {
+                .object => |o| o,
+                else => return error.InvalidResponse,
+            };
+
+            // Not the reply we are waiting for: a notification, or a response
+            // to some other request.
+            const id_value = obj.get("id") orelse continue;
+            const response_id = switch (id_value) {
+                .integer => |i| i,
+                else => continue,
+            };
+            if (response_id != id) continue;
+
+            if (obj.get("error")) |err_value| {
+                try self.recordServerError(allocator, err_value);
+                return error.ServerError;
+            }
+
+            const result = obj.get("result") orelse return error.InvalidResponse;
+            keep = true;
+            return .{ .parsed = parsed, .result = result };
+        }
+    }
+
+    /// Stores the code and message from a JSON-RPC error response so the
+    /// caller can inspect them after `error.ServerError`.
+    fn recordServerError(self: *Self, allocator: std.mem.Allocator, err_value: std.json.Value) !void {
+        self.clearServerError(allocator);
+        const obj = switch (err_value) {
+            .object => |o| o,
+            else => return,
+        };
+        const code: i64 = switch (obj.get("code") orelse .null) {
+            .integer => |i| i,
+            else => 0,
+        };
+        const message = switch (obj.get("message") orelse .null) {
+            .string => |m| try allocator.dupe(u8, m),
+            else => try allocator.dupe(u8, ""),
+        };
+        self.last_error = .{ .code = code, .message = message };
+    }
+
+    fn clearServerError(self: *Self, allocator: std.mem.Allocator) void {
+        if (self.last_error) |e| {
+            allocator.free(e.message);
+            self.last_error = null;
         }
     }
 
     /// Sends a JSON-RPC notification to the connected server.
     fn sendNotification(self: *Self, io: std.Io, allocator: std.mem.Allocator, method: []const u8, params: ?std.json.Value) !void {
+        const t = self.transport orelse return error.NotConnected;
         const notification = jsonrpc.createNotification(method, params);
         const json = try jsonrpc.serializeMessage(allocator, .{ .notification = notification });
         defer allocator.free(json);
-
-        if (self.transport) |t| {
-            t.send(io, allocator, json) catch {
-                std.log.err("Failed to send notification", .{});
-                return;
-            };
-        }
+        try t.send(io, allocator, json);
     }
 
     /// Requests the list of available tools from the server.
-    pub fn listTools(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
-        try self.sendRequest(io, allocator, "tools/list", null);
+    pub fn listTools(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
+        return self.request(io, allocator, "tools/list", null);
     }
 
     /// Invokes a tool on the server with optional arguments.
-    pub fn callTool(self: *Self, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !void {
+    pub fn callTool(self: *Self, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !Response {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
         var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "name", .{ .string = name });
+        try params.put(aa, "name", .{ .string = name });
         if (arguments) |args| {
-            try params.put(allocator, "arguments", args);
+            try params.put(aa, "arguments", args);
         }
-        try self.sendRequest(io, allocator, "tools/call", .{ .object = params });
+        return self.request(io, allocator, "tools/call", .{ .object = params });
     }
 
     /// Requests the list of available resources from the server.
-    pub fn listResources(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
-        try self.sendRequest(io, allocator, "resources/list", null);
+    pub fn listResources(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
+        return self.request(io, allocator, "resources/list", null);
     }
 
     /// Reads a resource from the server by URI.
-    pub fn readResource(self: *Self, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !void {
-        var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "uri", .{ .string = uri });
-        try self.sendRequest(io, allocator, "resources/read", .{ .object = params });
+    pub fn readResource(self: *Self, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response {
+        return self.requestWithUri(io, allocator, "resources/read", uri);
     }
 
-    /// Subscribes to updates for a resource URI.
-    pub fn subscribeResource(self: *Self, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !void {
-        var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "uri", .{ .string = uri });
-        try self.sendRequest(io, allocator, "resources/subscribe", .{ .object = params });
+    /// Subscribes to change notifications for a resource.
+    pub fn subscribeResource(self: *Self, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response {
+        return self.requestWithUri(io, allocator, "resources/subscribe", uri);
     }
 
-    /// Unsubscribes from updates for a resource URI.
-    pub fn unsubscribeResource(self: *Self, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !void {
+    /// Unsubscribes from change notifications for a resource.
+    pub fn unsubscribeResource(self: *Self, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response {
+        return self.requestWithUri(io, allocator, "resources/unsubscribe", uri);
+    }
+
+    fn requestWithUri(self: *Self, io: std.Io, allocator: std.mem.Allocator, method: []const u8, uri: []const u8) !Response {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
         var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "uri", .{ .string = uri });
-        try self.sendRequest(io, allocator, "resources/unsubscribe", .{ .object = params });
+        try params.put(arena.allocator(), "uri", .{ .string = uri });
+        return self.request(io, allocator, method, .{ .object = params });
     }
 
     /// Requests the list of resource templates from the server.
-    pub fn listResourceTemplates(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
-        try self.sendRequest(io, allocator, "resources/templates/list", null);
+    pub fn listResourceTemplates(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
+        return self.request(io, allocator, "resources/templates/list", null);
     }
 
     /// Requests the list of available prompts from the server.
-    pub fn listPrompts(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
-        try self.sendRequest(io, allocator, "prompts/list", null);
+    pub fn listPrompts(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
+        return self.request(io, allocator, "prompts/list", null);
     }
 
-    /// Fetches a prompt from the server with optional arguments.
-    pub fn getPrompt(self: *Self, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !void {
+    /// Fetches a prompt by name with optional arguments.
+    pub fn getPrompt(self: *Self, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !Response {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
         var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "name", .{ .string = name });
+        try params.put(aa, "name", .{ .string = name });
         if (arguments) |args| {
-            try params.put(allocator, "arguments", args);
+            try params.put(aa, "arguments", args);
         }
-        try self.sendRequest(io, allocator, "prompts/get", .{ .object = params });
+        return self.request(io, allocator, "prompts/get", .{ .object = params });
     }
 
-    /// Requests argument completion suggestions.
-    pub fn complete(self: *Self, io: std.Io, allocator: std.mem.Allocator, ref: std.json.Value, argument: std.json.Value) !void {
+    /// Requests a completion suggestion for a prompt or resource argument.
+    pub fn complete(self: *Self, io: std.Io, allocator: std.mem.Allocator, ref: std.json.Value, argument: std.json.Value) !Response {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
         var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "ref", ref);
-        try params.put(allocator, "argument", argument);
-        try self.sendRequest(io, allocator, "completion/complete", .{ .object = params });
+        try params.put(aa, "ref", ref);
+        try params.put(aa, "argument", argument);
+        return self.request(io, allocator, "completion/complete", .{ .object = params });
     }
 
-    /// Sets the log level on the server.
-    pub fn setLogLevel(self: *Self, io: std.Io, allocator: std.mem.Allocator, level: []const u8) !void {
+    /// Sets the minimum logging level the server should emit.
+    pub fn setLogLevel(self: *Self, io: std.Io, allocator: std.mem.Allocator, level: []const u8) !Response {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
         var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "level", .{ .string = level });
-        try self.sendRequest(io, allocator, "logging/setLevel", .{ .object = params });
+        try params.put(arena.allocator(), "level", .{ .string = level });
+        return self.request(io, allocator, "logging/setLevel", .{ .object = params });
     }
 
-    /// Sends a ping to the server.
-    pub fn ping(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
-        try self.sendRequest(io, allocator, "ping", null);
+    /// Sends a ping to check the connection is alive.
+    pub fn ping(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
+        return self.request(io, allocator, "ping", null);
     }
 
-    /// Gets the status and metadata of a task.
-    pub fn getTask(self: *Self, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !void {
-        var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "taskId", .{ .string = taskId });
-        try self.sendRequest(io, allocator, "tasks/get", .{ .object = params });
+    /// Fetches the status of a task.
+    pub fn getTask(self: *Self, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !Response {
+        return self.requestWithTaskId(io, allocator, "tasks/get", taskId);
     }
 
-    /// Gets the result payload of a completed task.
-    pub fn getTaskResult(self: *Self, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !void {
-        var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "taskId", .{ .string = taskId });
-        try self.sendRequest(io, allocator, "tasks/result", .{ .object = params });
+    /// Fetches the result of a completed task.
+    pub fn getTaskResult(self: *Self, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !Response {
+        return self.requestWithTaskId(io, allocator, "tasks/result", taskId);
     }
 
-    /// Lists all tasks.
-    pub fn listTasks(self: *Self, io: std.Io, allocator: std.mem.Allocator) !void {
-        try self.sendRequest(io, allocator, "tasks/list", null);
+    /// Requests the list of tasks from the server.
+    pub fn listTasks(self: *Self, io: std.Io, allocator: std.mem.Allocator) !Response {
+        return self.request(io, allocator, "tasks/list", null);
     }
 
     /// Cancels a running task.
-    pub fn cancelTask(self: *Self, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !void {
+    pub fn cancelTask(self: *Self, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !Response {
+        return self.requestWithTaskId(io, allocator, "tasks/cancel", taskId);
+    }
+
+    fn requestWithTaskId(self: *Self, io: std.Io, allocator: std.mem.Allocator, method: []const u8, taskId: []const u8) !Response {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
         var params: std.json.ObjectMap = .empty;
-        try params.put(allocator, "taskId", .{ .string = taskId });
-        try self.sendRequest(io, allocator, "tasks/cancel", .{ .object = params });
+        try params.put(arena.allocator(), "taskId", .{ .string = taskId });
+        return self.request(io, allocator, method, .{ .object = params });
     }
 
     /// Sends the notifications/initialized notification.
@@ -437,11 +639,27 @@ pub const Client = struct {
     }
 
     /// Disconnects from the server and releases the transport.
-    pub fn disconnect(self: *Self) void {
+    pub fn disconnect(self: *Self, io: std.Io) void {
         if (self.transport) |t| {
             t.close();
         }
+        if (self.child) |*c| {
+            c.kill(io);
+            self.child = null;
+        }
         self.state = .disconnected;
+    }
+
+    /// Capabilities the server reported during the handshake.
+    pub fn serverCapabilities(self: *const Self) ?std.json.Value {
+        const h = self.handshake orelse return null;
+        return h.get("capabilities");
+    }
+
+    /// Name/version the server reported during the handshake.
+    pub fn serverInfo(self: *const Self) ?std.json.Value {
+        const h = self.handshake orelse return null;
+        return h.get("serverInfo");
     }
 };
 
@@ -450,7 +668,7 @@ test "Client initialization" {
         .name = "test-client",
         .version = "1.0.0",
     });
-    defer client.deinit(std.testing.allocator);
+    defer client.deinit(std.Io.failing, std.testing.allocator);
 
     try std.testing.expectEqual(ClientState.disconnected, client.state);
 }
@@ -460,7 +678,7 @@ test "Client capabilities" {
         .name = "test",
         .version = "1.0.0",
     });
-    defer client.deinit(std.testing.allocator);
+    defer client.deinit(std.Io.failing, std.testing.allocator);
 
     client.enableSampling();
     client.enableRoots(true);
@@ -478,7 +696,7 @@ test "Client advanced sampling" {
         .name = "test",
         .version = "1.0.0",
     });
-    defer client.deinit(std.testing.allocator);
+    defer client.deinit(std.Io.failing, std.testing.allocator);
 
     client.enableSamplingAdvanced(true, true);
     try std.testing.expect(client.capabilities.sampling.?.context != null);
@@ -490,7 +708,7 @@ test "Client add root" {
         .name = "test",
         .version = "1.0.0",
     });
-    defer client.deinit(std.testing.allocator);
+    defer client.deinit(std.Io.failing, std.testing.allocator);
 
     try client.addRoot(std.testing.allocator, "file:///tmp", "Temp");
     try std.testing.expectEqual(@as(usize, 1), client.roots_list.items.len);
@@ -503,6 +721,7 @@ test "constructing a client does not contact the network by default" {
     const allocator = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
+    const io = threaded.io();
 
     const cfg: ClientConfig = .{ .name = "c", .version = "1.0.0" };
     try std.testing.expect(!cfg.check_for_updates);
@@ -511,8 +730,68 @@ test "constructing a client does not contact the network by default" {
     // process-wide one-shot latch, so an earlier test could mask an implicit
     // call here.
     const before = report.invocation_count.load(.monotonic);
-    var client: Client = .init(threaded.io(), allocator, cfg);
-    defer client.deinit(allocator);
+    var client: Client = .init(io, allocator, cfg);
+    defer client.deinit(io, allocator);
     try std.testing.expectEqual(before, report.invocation_count.load(.monotonic));
     try std.testing.expect(client.update_thread == null);
+}
+
+test "connectStdio spawns a server and runs a real request/response session" {
+    // The whole point of #24/#25: this drives an actual MCP server over stdio
+    // and reads results back. Before, `connectStdio` spawned nothing and every
+    // request method returned `void`.
+    const build_options = @import("build_options");
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+
+    try client.connectStdio(io, allocator, build_options.example_server_path, &.{});
+
+    try std.testing.expectEqual(ClientState.connected, client.state);
+    try std.testing.expect(client.child != null);
+    try std.testing.expectEqualStrings(protocol.VERSION, client.negotiated_version.?);
+    try std.testing.expectEqualStrings("simple-server", client.serverInfo().?.object.get("name").?.string);
+
+    const tools = try client.listTools(io, allocator);
+    defer tools.deinit();
+
+    var saw_greet = false;
+    for (tools.get("tools").?.array.items) |tool| {
+        if (std.mem.eql(u8, tool.object.get("name").?.string, "greet")) saw_greet = true;
+    }
+    try std.testing.expect(saw_greet);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var args: std.json.ObjectMap = .empty;
+    try args.put(arena.allocator(), "name", .{ .string = "Ada" });
+
+    const called = try client.callTool(io, allocator, "greet", .{ .object = args });
+    defer called.deinit();
+
+    const text = called.get("content").?.array.items[0].object.get("text").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "Ada") != null);
+}
+
+test "a server error surfaces as an error with its code and message" {
+    const build_options = @import("build_options");
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+
+    try client.connectStdio(io, allocator, build_options.example_server_path, &.{});
+
+    try std.testing.expectError(error.ServerError, client.callTool(io, allocator, "no-such-tool", null));
+    try std.testing.expect(client.last_error != null);
+    try std.testing.expect(client.last_error.?.message.len > 0);
 }
