@@ -121,6 +121,31 @@ try server.client.?.onNotification(
 );
 ```
 
+## Spawn Context
+
+Servers are routinely configured with paths relative to the workspace the host
+is operating on, and routinely need environment variables the host holds. Both
+are set once, for every server the host starts:
+
+```zig
+var host: mcp.Host = .init(io, allocator, .{
+    .name = "my-app",
+    .version = "1.0.0",
+    .cwd = .{ .path = workspace_root },
+    .base_environ = init.environ_map,
+    .inherit_environ = false,
+});
+```
+
+A server's own `env` from configuration is layered on top of `base_environ`.
+Setting `inherit_environ = false` is worth doing for servers you did not
+write: a third-party server has no need for every secret the host process
+happens to hold.
+
+std 0.16 does not expose the environment as a global — it is handed to `main`
+as `std.process.Init.environ_map` — so `base_environ` is the only way to build
+on the host's own environment.
+
 ## Known Limitation: No Startup Timeout
 
 A server that accepts a connection and then never answers `initialize` blocks
@@ -137,6 +162,9 @@ pub const HostConfig = struct {
     title: ?[]const u8 = null,
     tool_prefix: []const u8 = "mcp",
     server_stderr: std.process.SpawnOptions.StdIo = .ignore,
+    cwd: std.process.Child.Cwd = .inherit,
+    base_environ: ?*const std.process.Environ.Map = null,
+    inherit_environ: bool = true,
 };
 
 pub const Status = enum { configured, disabled, ready, failed, stopped };

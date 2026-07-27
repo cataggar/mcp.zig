@@ -40,6 +40,26 @@ pub const HostConfig = struct {
     tool_prefix: []const u8 = "mcp",
     /// What to do with each spawned server's stderr.
     server_stderr: std.process.SpawnOptions.StdIo = .ignore,
+    /// Working directory for every spawned server.
+    ///
+    /// Servers are routinely configured with paths relative to the workspace
+    /// the host is operating on, so leaving them in whatever directory the
+    /// host happens to have been launched from resolves those paths against
+    /// the wrong root.
+    cwd: std.process.Child.Cwd = .inherit,
+    /// The environment spawned servers start from.
+    ///
+    /// Pass `init.environ_map` from `std.process.Init`; std 0.16 does not
+    /// expose the environment as a global, so a host that wants a server's
+    /// configured `env` layered onto the inherited environment has to supply
+    /// it here.
+    base_environ: ?*const std.process.Environ.Map = null,
+    /// When false a server receives only `base_environ` plus its own
+    /// configured `env`.
+    ///
+    /// Worth setting for servers you did not write: a third-party server has
+    /// no need for every secret the host process happens to hold.
+    inherit_environ: bool = true,
 };
 
 pub const Status = enum {
@@ -211,7 +231,7 @@ pub const Host = struct {
                 self.io,
                 self.allocator,
                 server.spec.command orelse return error.MissingCommand,
-                server.spec.stdioOptions(),
+                self.stdioOptionsFor(server.spec),
             ),
             .http, .sse => try client.connectHttpOptions(
                 self.io,
@@ -222,6 +242,15 @@ pub const Host = struct {
         }
 
         server.client = client;
+    }
+
+    /// The spec's own options, plus the spawn context every server shares.
+    fn stdioOptionsFor(self: *const Self, spec: ServerSpec) client_mod.StdioOptions {
+        var options = spec.stdioOptions();
+        options.cwd = self.config.cwd;
+        options.base_environ = self.config.base_environ;
+        options.inherit_environ = self.config.inherit_environ;
+        return options;
     }
 
     /// Reads the server's tools and republishes them under exposed names.
@@ -826,4 +855,78 @@ test "a refresh that fails leaves the previous tools intact and callable" {
     // Alpha is untouched by beta's failed refresh.
     const result = try host.callTool(allocator, "mcp_alpha_greet", null);
     defer result.deinit();
+}
+
+test "the spawn context reaches every server the host starts" {
+    const allocator = testing.allocator;
+    const build_options = @import("build_options");
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "marker.txt", .data = "found by cwd" });
+
+    // The child resolves argv[0] after chdir, so the server path has to be
+    // absolute once a cwd is set.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &buf);
+    const server_path = try std.fs.path.resolve(
+        allocator,
+        &.{ buf[0..cwd_len], build_options.env_probe_server_path },
+    );
+    defer allocator.free(server_path);
+
+    const escaped = try std.mem.replaceOwned(u8, allocator, server_path, "\\", "\\\\");
+    defer allocator.free(escaped);
+    const bytes = try std.fmt.allocPrint(allocator,
+        \\{{"mcpServers":{{"probe":{{"command":"{s}","env":{{"HOST_SPAWN_MARKER":"from-host"}}}}}}}}
+    , .{escaped});
+    defer allocator.free(bytes);
+
+    var doc = try config_mod.parse(allocator, bytes, "test.json");
+    defer doc.deinit();
+
+    var base: std.process.Environ.Map = .init(allocator);
+    defer base.deinit();
+    try base.put("HOST_BASE_MARKER", "from-base");
+
+    var host: Host = .init(io, allocator, .{
+        .name = "test-host",
+        .version = "1.0.0",
+        .cwd = .{ .dir = tmp.dir },
+        .base_environ = &base,
+        .inherit_environ = false,
+    });
+    defer host.deinit();
+    try host.addDocument(doc);
+    _ = try host.startServer("probe");
+
+    // cwd: the server resolves a relative path against the host's directory.
+    {
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        defer arena.deinit();
+        var args: std.json.ObjectMap = .empty;
+        try args.put(arena.allocator(), "path", .{ .string = "marker.txt" });
+        const result = try host.callTool(allocator, "mcp_probe_read_x5frelative", .{ .object = args });
+        defer result.deinit();
+        const text = result.result.object.get("content").?.array.items[0].object.get("text").?.string;
+        try testing.expect(std.mem.indexOf(u8, text, "found by cwd") != null);
+    }
+
+    // base_environ, and the spec's own env layered on top of it.
+    for ([_][2][]const u8{
+        .{ "HOST_BASE_MARKER", "from-base" },
+        .{ "HOST_SPAWN_MARKER", "from-host" },
+    }) |pair| {
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        defer arena.deinit();
+        var args: std.json.ObjectMap = .empty;
+        try args.put(arena.allocator(), "name", .{ .string = pair[0] });
+        const result = try host.callTool(allocator, "mcp_probe_getenv", .{ .object = args });
+        defer result.deinit();
+        const text = result.result.object.get("content").?.array.items[0].object.get("text").?.string;
+        try testing.expect(std.mem.indexOf(u8, text, pair[1]) != null);
+    }
 }
