@@ -198,6 +198,42 @@ concurrent reuse is rejected. At most `Session.max_inflight_requests` (256)
 requests may be in flight on one session; beyond that the server answers
 `-32603 Too many requests in flight`.
 
+### Methods outside the specification
+
+A host built on this library may need methods MCP does not define — a
+lifecycle `shutdown`, an editor-specific query, an internal health probe.
+Register them rather than forking the dispatch:
+
+```zig
+fn shutdown(ctx: ?*anyopaque, _: std.Io, allocator: Allocator, _: ?std.json.Value) anyerror!std.json.Value {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    app.stop();
+
+    var result: std.json.ObjectMap = .empty;
+    try result.put(allocator, "stopped", .{ .bool = true });
+    return .{ .object = result };
+}
+
+try server.onMethod("shutdown", &app, shutdown);
+try server.onNotificationMethod("exit", &app, exit);
+```
+
+The returned `std.json.Value` becomes the JSON-RPC `result`, allocated from
+the per-message arena. A handler that returns an error is answered `-32603`
+with the error name, so a failing custom method cannot take the connection
+down. A notification handler has nothing to reply to, so a failure is logged.
+
+Three rules keep the registry from becoming a way to break the protocol:
+
+- **Built-ins win, and cannot be shadowed.** The registry is consulted only
+  after every specification method has declined. Registering a name the server
+  answers itself returns `error.MethodReserved` — a registration that silently
+  never runs is a worse outcome than being told no.
+- **An unregistered method still answers `-32601`.** Nothing changes for
+  clients that only speak MCP.
+- **Registering the same method twice replaces the handler**, so re-registering
+  during reconfiguration is safe.
+
 ## Complete Example
 
 ```zig
