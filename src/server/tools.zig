@@ -10,6 +10,29 @@ const jsonrpc = @import("../protocol/jsonrpc.zig");
 const schema = @import("../protocol/schema.zig");
 const types = @import("../protocol/types.zig");
 
+pub const RequestContext = @import("request.zig").RequestContext;
+
+/// Runs a tool call.
+pub const ToolHandler = *const fn (
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+) ToolError!ToolResult;
+
+/// Runs a tool call that can observe the request it is serving.
+///
+/// Use this for work that may take long enough to be worth abandoning: poll
+/// `request.isCancelled()` and return early once the client has withdrawn the
+/// call. Everything else is identical to `ToolHandler`.
+pub const ContextualToolHandler = *const fn (
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+    request: *const RequestContext,
+) ToolError!ToolResult;
+
 /// A tool that can be exposed by an MCP server.
 pub const Tool = struct {
     name: []const u8,
@@ -20,8 +43,24 @@ pub const Tool = struct {
     execution: ?types.ToolExecution = null,
     icons: ?[]const types.Icon = null,
     annotations: ?ToolAnnotations = null,
-    handler: *const fn (user_data: ?*anyopaque, io: std.Io, allocator: std.mem.Allocator, arguments: ?std.json.Value) ToolError!ToolResult,
+    /// Set exactly one of `handler` and `contextual_handler`. When both are
+    /// set, `contextual_handler` wins.
+    handler: ?ToolHandler = null,
+    contextual_handler: ?ContextualToolHandler = null,
     user_data: ?*anyopaque = null,
+
+    /// Runs the tool, whichever handler shape it was registered with.
+    pub fn invoke(
+        self: Tool,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        arguments: ?std.json.Value,
+        request: *const RequestContext,
+    ) ToolError!ToolResult {
+        if (self.contextual_handler) |h| return h(self.user_data, io, allocator, arguments, request);
+        if (self.handler) |h| return h(self.user_data, io, allocator, arguments);
+        return ToolError.ExecutionFailed;
+    }
 };
 
 /// Annotations describing tool behavior characteristics for client display and safety.
@@ -86,8 +125,15 @@ pub const ToolBuilder = struct {
     }
 
     /// Sets the tool handler function.
-    pub fn handler(self: *Self, h: *const fn (?*anyopaque, std.Io, std.mem.Allocator, ?std.json.Value) ToolError!ToolResult) *Self {
+    pub fn handler(self: *Self, h: ToolHandler) *Self {
         self.tool.handler = h;
+        self.tool.contextual_handler = null;
+        return self;
+    }
+
+    /// Sets a handler that can observe the request it is serving.
+    pub fn contextualHandler(self: *Self, h: ContextualToolHandler) *Self {
+        self.tool.contextual_handler = h;
         return self;
     }
 

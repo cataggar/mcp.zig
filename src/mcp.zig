@@ -65,6 +65,7 @@ pub const Server = server.Server;
 pub const ServerConfig = server.ServerConfig;
 
 pub const tools = @import("server/tools.zig");
+pub const RequestContext = @import("server/request.zig").RequestContext;
 pub const Tool = tools.Tool;
 pub const ToolBuilder = tools.ToolBuilder;
 pub const ToolResult = tools.ToolResult;
