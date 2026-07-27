@@ -602,10 +602,19 @@ test "the host outlives a spec whose owning document is gone" {
 /// the end-to-end tests exercise real spawning, listing and calling.
 fn testDocForExampleServer(comptime bytes_fmt: []const u8) !config_mod.Document {
     const build_options = @import("build_options");
-    const bytes = try std.fmt.allocPrint(testing.allocator, bytes_fmt, .{
+
+    // Windows paths are full of backslashes, which are not legal in a JSON
+    // string literal.
+    const path = try std.mem.replaceOwned(
+        u8,
+        testing.allocator,
         build_options.example_server_path,
-        build_options.example_server_path,
-    });
+        "\\",
+        "\\\\",
+    );
+    defer testing.allocator.free(path);
+
+    const bytes = try std.fmt.allocPrint(testing.allocator, bytes_fmt, .{ path, path });
     defer testing.allocator.free(bytes);
     return config_mod.parse(testing.allocator, bytes, "test.json");
 }
