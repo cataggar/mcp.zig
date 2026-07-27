@@ -233,6 +233,15 @@ pub const Server = struct {
         /// requires `auth_token`.
         allow_non_loopback: bool = false,
 
+        /// Origins permitted to make browser-initiated requests, e.g.
+        /// `"https://app.example.com"`.
+        ///
+        /// Defaults to empty, which rejects any request carrying an `Origin`
+        /// header. Ordinary MCP clients are not browsers and send no `Origin`
+        /// at all, so the default is transparent for them while closing the
+        /// door on web pages the user happens to visit.
+        allowed_origins: []const []const u8 = &.{},
+
         /// Shortest accepted token. Long enough that an online guessing attack
         /// against a high-entropy token is not worth attempting.
         pub const min_auth_token_len = 32;
@@ -363,6 +372,34 @@ pub const Server = struct {
             return;
         }
 
+        // Reject browser-initiated requests from unapproved origins before
+        // doing anything else. Binding loopback is no defence against these,
+        // because the request originates from the victim's own machine.
+        if (originHeader(&request)) |origin| {
+            if (!originIsAllowed(origin, config.allowed_origins)) {
+                try request.respond("Forbidden", .{
+                    .status = .forbidden,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/plain" },
+                    },
+                });
+                return;
+            }
+        }
+
+        // `application/json` is not a CORS-simple content type, so requiring it
+        // forces a preflight that this server never answers. That is what stops
+        // a page from POSTing here with `text/plain` and no preflight at all.
+        if (!hasJsonContentType(&request)) {
+            try request.respond("Expected Content-Type: application/json", .{
+                .status = .unsupported_media_type,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/plain" },
+                },
+            });
+            return;
+        }
+
         // Authenticate before reading the body, so an unauthenticated peer
         // cannot make the server allocate for it.
         if (config.auth_token) |expected| {
@@ -412,6 +449,48 @@ pub const Server = struct {
             presented_digest,
             expected_digest,
         );
+    }
+
+    /// The request's `Origin` header, or null when it sends none.
+    ///
+    /// An empty or `null` origin counts as present and unapproved: those are
+    /// what a sandboxed iframe or a redirected request produces, and neither
+    /// should be able to reach the tools.
+    fn originHeader(request: *http.Server.Request) ?[]const u8 {
+        var header_it = http.HeaderIterator.init(request.head_buffer);
+        while (header_it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "origin")) return header.value;
+        }
+        return null;
+    }
+
+    fn originIsAllowed(origin: []const u8, allowed: []const []const u8) bool {
+        for (allowed) |candidate| {
+            // Origins are compared case-insensitively because scheme and host
+            // are case-insensitive; the port, if any, is digits either way.
+            if (std.ascii.eqlIgnoreCase(origin, candidate)) return true;
+        }
+        return false;
+    }
+
+    /// Whether the request declares a JSON body.
+    ///
+    /// Parameters such as `; charset=utf-8` are tolerated. A missing header is
+    /// rejected: the MCP HTTP transport requires `application/json`, and every
+    /// real client sends it.
+    fn hasJsonContentType(request: *http.Server.Request) bool {
+        var header_it = http.HeaderIterator.init(request.head_buffer);
+        while (header_it.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+
+            const media_type = std.mem.trim(
+                u8,
+                header.value[0 .. std.mem.indexOfScalar(u8, header.value, ';') orelse header.value.len],
+                " \t",
+            );
+            return std.ascii.eqlIgnoreCase(media_type, "application/json");
+        }
+        return false;
     }
 
     fn handleHttpJsonRpcRequest(self: *Self, io: std.Io, allocator: std.mem.Allocator, request: *http.Server.Request) !void {
@@ -1930,4 +2009,35 @@ test "HttpRunConfig rejects a short token even on loopback" {
         }).validate(),
     );
     try (Server.HttpRunConfig{ .auth_token = "x" ** 32 }).validate();
+}
+
+test "originIsAllowed matches only listed origins" {
+    const allowed = [_][]const u8{ "https://app.example.com", "http://localhost:3000" };
+
+    try std.testing.expect(Server.originIsAllowed("https://app.example.com", &allowed));
+    try std.testing.expect(Server.originIsAllowed("http://localhost:3000", &allowed));
+    // Scheme and host are case-insensitive.
+    try std.testing.expect(Server.originIsAllowed("HTTPS://APP.EXAMPLE.COM", &allowed));
+
+    const rejected = [_][]const u8{
+        // Wrong scheme, wrong port, and lookalike hosts must all fail.
+        "http://app.example.com",
+        "https://app.example.com:8443",
+        "https://evil.com",
+        "https://app.example.com.evil.com",
+        "https://evilapp.example.com",
+        "http://localhost:3001",
+        "null",
+        "",
+    };
+    for (rejected) |origin| {
+        try std.testing.expect(!Server.originIsAllowed(origin, &allowed));
+    }
+}
+
+test "originIsAllowed rejects everything when no origins are configured" {
+    const none: []const []const u8 = &.{};
+    try std.testing.expect(!Server.originIsAllowed("https://app.example.com", none));
+    try std.testing.expect(!Server.originIsAllowed("null", none));
+    try std.testing.expect(!Server.originIsAllowed("", none));
 }

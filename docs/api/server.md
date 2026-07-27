@@ -40,7 +40,9 @@ Note: HTTP mode binds loopback by default. Binding any other address requires
 characters; otherwise `run` fails with `NonLoopbackBindRequiresOptIn` or
 `NonLoopbackBindRequiresAuthToken` before the listener is created. When
 `auth_token` is set, every request must present `Authorization: Bearer <token>`
-or receive `401`.
+or receive `401`. Requests carrying an `Origin` header are rejected with `403`
+unless the origin appears in `allowed_origins` (empty by default), and every
+request must declare `Content-Type: application/json` or receive `415`.
 
 ## Registration
 

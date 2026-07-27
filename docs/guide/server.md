@@ -76,6 +76,22 @@ anything else is answered with `401`. A configuration that would expose tools
 without authentication is rejected before the listener is created, so the
 server refuses to start rather than starting insecurely.
 
+Requests are also screened for browser origin. Anything carrying an `Origin`
+header is rejected with `403` unless listed in `allowed_origins`, and the body
+must be declared `application/json` or the request is rejected with `415`:
+
+```zig
+try server.run(io, allocator, .{ .http = .{
+    .port = 8080,
+    .allowed_origins = &.{"https://app.example.com"},
+} });
+```
+
+Ordinary MCP clients are not browsers and send no `Origin`, so the empty
+default is transparent for them while closing the door on web pages the user
+happens to visit. Binding loopback is no defence here, because such a request
+comes from the victim's own machine.
+
 The HTTP mode accepts JSON-RPC POST requests at the root path.
 
 ## Registering Components
