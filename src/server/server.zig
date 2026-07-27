@@ -247,6 +247,8 @@ pub const Server = struct {
     /// Listening socket, published while `runHttp` is active so `shutdown` can
     /// unblock a parked `accept` from another thread.
     http_listener: ?*std.Io.net.Server = null,
+    /// Address the listener is bound to, used to wake a parked `accept`.
+    http_bind_address: ?std.Io.net.IpAddress = null,
     pub const max_http_body_size: usize = 4 * 1024 * 1024;
 
     const Self = @This();
@@ -598,10 +600,12 @@ pub const Server = struct {
 
         self.connections_mutex.lock(io) catch return error.Canceled;
         self.http_listener = &listener;
+        self.http_bind_address = address;
         self.connections_mutex.unlock(io);
         defer {
             self.connections_mutex.lock(io) catch {};
             self.http_listener = null;
+            self.http_bind_address = null;
             self.connections_mutex.unlock(io);
         }
 
@@ -682,9 +686,22 @@ pub const Server = struct {
         if (self.http_listener) |listener| {
             // Documented by std as a concurrent cancellation mechanism for
             // `accept`, which otherwise blocks until a client happens to connect.
+            // It does not unblock a parked `accept` on every platform, though,
+            // so also dial the listener: whichever mechanism works first wins,
+            // and the accept loop closes the wake-up connection and stops.
             const listening: std.Io.net.Stream = .{ .socket = listener.socket };
             listening.shutdown(io, .both) catch {};
         }
+        const bind_address = self.http_bind_address;
+        self.connections_mutex.unlock(io);
+        if (bind_address) |addr| {
+            if (addr.getPort() != 0) {
+                if (std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream })) |stream| {
+                    stream.close(io);
+                } else |_| {}
+            }
+        }
+        self.connections_mutex.lock(io) catch return;
     }
 
     /// Wait for in-flight connections to finish, up to `grace_ms`.
@@ -2941,12 +2958,16 @@ test "shutdown unblocks a parked accept" {
     var server: Server = .init(std.testing.allocator, .{ .name = "t", .version = "1" });
     defer server.deinit();
 
+    // A fixed port, because the wake-up connection has to be able to dial the
+    // listener back. `reuse_address` keeps a repeat run from tripping over
+    // `TIME_WAIT`.
+    const port: u16 = 47821;
     const Runner = struct {
-        fn run(s: *Server, run_io: std.Io, allocator: std.mem.Allocator) void {
-            s.runHttp(run_io, allocator, .{ .port = 0, .shutdown_grace_ms = 200 }) catch {};
+        fn run(s: *Server, run_io: std.Io, allocator: std.mem.Allocator, p: u16) void {
+            s.runHttp(run_io, allocator, .{ .port = p, .shutdown_grace_ms = 200 }) catch {};
         }
     };
-    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &server, io, std.testing.allocator });
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &server, io, std.testing.allocator, port });
 
     // Wait for the listener to be published, i.e. accept is parked.
     var spins: usize = 0;

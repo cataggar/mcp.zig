@@ -110,10 +110,13 @@ directly, since `std.posix.setsockopt` is a compile error there.
 server.shutdown(io); // e.g. from a signal handler thread
 ```
 
-It marks the server as shutting down and shuts the listening socket down, which
-unblocks a parked `accept`. Without that, a server with no traffic could not be
-stopped at all, because the accept loop only re-checks state between
-connections. `runHttp` then waits up to `shutdown_grace_ms` for in-flight
+It marks the server as shutting down, shuts the listening socket down, and dials
+the listener once. Either mechanism unblocks a parked `accept`; the socket
+shutdown does not do so on every platform, so the wake-up connection is what
+makes shutdown portable. It requires a fixed port — a server bound to port `0`
+stops only once a client happens to connect. Without any of this, a server with
+no traffic could not be stopped at all, because the accept loop only re-checks
+state between connections. `runHttp` then waits up to `shutdown_grace_ms` for in-flight
 connections to finish before returning.
 
 Repeated accept failures back off from 1 ms to a cap of 1 s rather than spinning.
