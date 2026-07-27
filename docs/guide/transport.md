@@ -131,7 +131,9 @@ start.
 
 | Situation | Status |
 | --------- | ------ |
-| Method other than `POST`/`DELETE` | `405` |
+| Method other than `POST`/`GET`/`DELETE` | `405` |
+| `GET` without `Accept: text/event-stream` | `406` |
+| `GET` without `Mcp-Session-Id` | `400` |
 | Disallowed `Origin` | `403` |
 | `Content-Type` other than `application/json` | `415` |
 | Missing or wrong `Authorization` | `401` with `WWW-Authenticate` |
@@ -156,6 +158,26 @@ A session that is terminated while it still has work in flight is unpublished
 immediately and its `cancel_requested` flag is set. Long-running tool handlers
 should poll `session.isCancelled()` and abandon work whose result can no longer
 be delivered.
+
+### Event streams
+
+`GET` with `Accept: text/event-stream` and an `Mcp-Session-Id` opens the
+server-to-client stream. Server-initiated notifications — `tools/list_changed`,
+progress, log messages — are delivered there. Without it they could only ride
+along with a response the client happened to ask for.
+
+Every event carries an `id`. A client that reconnects with `Last-Event-ID: N`
+receives everything newer than `N` from the session's replay buffer, which holds
+the most recent `Session.max_replay_events` (256) events. Ids keep advancing
+past dropped events, so a client can tell it missed some and re-initialize.
+
+A `POST` that asks for `text/event-stream` now returns every message the handler
+produced, each as its own event, so progress notifications emitted before the
+result are no longer discarded. An idle stream emits a `: keepalive` comment
+every 15 seconds so proxies do not reap it.
+
+Message payloads are split on newlines across multiple `data:` lines, so an
+embedded newline cannot terminate a frame early and forge the events after it.
 
 ### Browser-originated requests
 
