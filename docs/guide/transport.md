@@ -67,12 +67,32 @@ try server.run(io, allocator, .{ .http = .{
 | `host` | `"localhost"` | Address to bind. Loopback forms (`localhost`, `127.0.0.0/8`, `::1`) need no opt-in. |
 | `allow_non_loopback` | `false` | Required to bind any other address. |
 | `auth_token` | `null` | Bearer token required on every request. Mandatory for non-loopback binds; minimum 32 characters. |
+| `allowed_origins` | `&.{}` | Origins allowed to make browser-initiated requests. Empty rejects any request carrying `Origin`. |
 
 When `auth_token` is set, every request must carry
 `Authorization: Bearer <token>`; anything else is answered with `401` before
 the body is read. The configuration is validated before the listener is
 created, so a server that would expose tools without authentication refuses to
 start.
+
+### Browser-originated requests
+
+Two checks run before authentication:
+
+- Any request carrying an `Origin` header is rejected with `403` unless that
+  origin is listed in `allowed_origins`. Ordinary MCP clients are not browsers
+  and send no `Origin`, so the empty default is transparent for them.
+- The body must be declared `application/json`, or the request is rejected with
+  `415`. Parameters such as `; charset=utf-8` are fine.
+
+The `Content-Type` requirement is what blocks cross-site requests, not merely a
+formality. `text/plain`, `application/x-www-form-urlencoded` and
+`multipart/form-data` are the CORS-*simple* content types, which browsers send
+with **no preflight**. Requiring `application/json` forces a preflight that
+this server never answers.
+
+Binding loopback is no protection against either of these, because the request
+originates from the victim's own browser.
 
 ### Client Side
 
