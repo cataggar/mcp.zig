@@ -185,6 +185,19 @@ fn toolHandler(_: ?*anyopaque, _: std.Io, allocator: Allocator, args: ?std.json.
 }
 ```
 
+### Request ids
+
+A JSON-RPC id identifies one exchange, so the server tracks the ids it is
+currently serving. A request that reuses an id while the original is still
+outstanding is answered with `-32600 Duplicate request id` — otherwise two
+responses would carry the same id and the client could not tell them apart.
+
+The id is released as soon as its response is sent, so ordinary clients that
+count from 1 and reuse ids across reconnects are unaffected; only genuinely
+concurrent reuse is rejected. At most `Session.max_inflight_requests` (256)
+requests may be in flight on one session; beyond that the server answers
+`-32603 Too many requests in flight`.
+
 ## Complete Example
 
 ```zig
