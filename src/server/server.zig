@@ -782,15 +782,6 @@ pub const Server = struct {
         };
     }
 
-    /// The `protocolVersion` a client asked for in `initialize`, if any.
-    fn requestedProtocolVersion(request: jsonrpc.Request) ?[]const u8 {
-        const params = request.params orelse return null;
-        if (params != .object) return null;
-        const value = params.object.get("protocolVersion") orelse return null;
-        if (value != .string) return null;
-        return value.string;
-    }
-
     /// A human-readable list of the versions this server speaks, for the
     /// `data` member of a version-mismatch error.
     fn describeSupportedVersions(self: *const Self, allocator: std.mem.Allocator) ![]const u8 {
@@ -2370,6 +2361,24 @@ pub const Server = struct {
         }
     }
 
+    /// `initialize` params that the specification requires but the client did
+    /// not supply. Kept separate so every rejection path words it identically.
+    fn sendInvalidInitializeParams(
+        self: *Self,
+        session: *Session,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        request: jsonrpc.Request,
+    ) !void {
+        const error_response = jsonrpc.createErrorResponse(
+            request.id,
+            jsonrpc.ErrorCode.INVALID_PARAMS,
+            "Invalid params",
+            .{ .string = "initialize requires a protocolVersion" },
+        );
+        try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+    }
+
     /// Handle initialize request
     fn handleInitialize(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
         // There is one initialization phase, so a second one is undefined
@@ -2388,47 +2397,60 @@ pub const Server = struct {
             return;
         }
 
-        session.state = .initializing;
+        // Everything below validates before it mutates. A handshake that is
+        // going to be refused must leave the session exactly as it found it:
+        // `handleRequest` only withholds the rest of the method surface while
+        // the state is `.uninitialized`, so advancing it first would mean a
+        // *rejected* initialize still opened the server up.
 
-        if (request.params) |params| {
-            if (params == .object) {
-                const obj = params.object;
-
-                if (obj.get("clientInfo")) |client_info_val| {
-                    if (client_info_val == .object) {
-                        const ci = client_info_val.object;
-                        const name = if (ci.get("name")) |n| if (n == .string) n.string else "unknown" else "unknown";
-                        const version = if (ci.get("version")) |v| if (v == .string) v.string else "0.0.0" else "0.0.0";
-                        if (session.client_info) |existing| {
-                            self.allocator.free(existing.name);
-                            self.allocator.free(existing.version);
-                        }
-                        session.client_info = .{
-                            .name = try self.allocator.dupe(u8, name),
-                            .version = try self.allocator.dupe(u8, version),
-                        };
-                    }
-                }
-            }
-        }
+        // `protocolVersion` is a required member of `InitializeRequest.params`.
+        // Treating an absent one as "no preference" would also make
+        // `strict_protocol_version` opt-out-able by simply omitting the field.
+        const params_value = request.params orelse
+            return self.sendInvalidInitializeParams(session, io, allocator, request);
+        if (params_value != .object)
+            return self.sendInvalidInitializeParams(session, io, allocator, request);
+        const params_obj = params_value.object;
+        const requested_value = params_obj.get("protocolVersion") orelse
+            return self.sendInvalidInitializeParams(session, io, allocator, request);
+        if (requested_value != .string)
+            return self.sendInvalidInitializeParams(session, io, allocator, request);
+        const requested = requested_value.string;
 
         // Reply with the client's version when we speak it, otherwise with our
         // own newest so the client can decide whether to continue — unless the
         // host pinned a version, in which case a mismatch is fatal.
         var negotiated_version: []const u8 = self.preferredProtocolVersion();
-        if (requestedProtocolVersion(request)) |requested| {
-            if (self.isSupportedProtocolVersion(requested)) {
-                negotiated_version = requested;
-            } else if (self.config.strict_protocol_version) {
-                const detail = try self.describeSupportedVersions(allocator);
-                const error_response = jsonrpc.createErrorResponse(
-                    request.id,
-                    jsonrpc.ErrorCode.INVALID_PARAMS,
-                    "Unsupported protocol version",
-                    .{ .string = detail },
-                );
-                try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
-                return;
+        if (self.isSupportedProtocolVersion(requested)) {
+            negotiated_version = requested;
+        } else if (self.config.strict_protocol_version) {
+            const detail = try self.describeSupportedVersions(allocator);
+            const error_response = jsonrpc.createErrorResponse(
+                request.id,
+                jsonrpc.ErrorCode.INVALID_PARAMS,
+                "Unsupported protocol version",
+                .{ .string = detail },
+            );
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+            return;
+        }
+
+        // Past this point the handshake is accepted, so it is safe to record it.
+        session.state = .initializing;
+
+        if (params_obj.get("clientInfo")) |client_info_val| {
+            if (client_info_val == .object) {
+                const ci = client_info_val.object;
+                const name = if (ci.get("name")) |n| if (n == .string) n.string else "unknown" else "unknown";
+                const version = if (ci.get("version")) |v| if (v == .string) v.string else "0.0.0" else "0.0.0";
+                if (session.client_info) |existing| {
+                    self.allocator.free(existing.name);
+                    self.allocator.free(existing.version);
+                }
+                session.client_info = .{
+                    .name = try self.allocator.dupe(u8, name),
+                    .version = try self.allocator.dupe(u8, version),
+                };
             }
         }
 
@@ -5548,4 +5570,101 @@ test "a malformed raw input schema is refused at registration" {
         .input_schema_json = "[]",
     }));
     try std.testing.expectEqual(@as(usize, 0), server.tools.count());
+}
+
+test "a refused initialize leaves the session closed to every other method" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pinned = [_][]const u8{"2025-11-25"};
+    var server: Server = .init(std.testing.allocator, .{
+        .name = "s",
+        .version = "1",
+        .supported_protocol_versions = &pinned,
+        .strict_protocol_version = true,
+    });
+    defer server.deinit();
+    try server.addTool(.{ .name = "secret", .description = "x", .handler = testNoopTool });
+
+    const refused = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01","capabilities":{},"clientInfo":{"name":"impostor","version":"9"}}}
+    );
+    defer refused.deinit();
+    const refused_body = refused.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, refused_body, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused_body, "Unsupported protocol version") != null);
+
+    // A handshake that was answered with an error agreed nothing, so it must
+    // not have moved the session on or recorded who asked.
+    try std.testing.expectEqual(SessionState.uninitialized, server.implicit_session.state);
+    try std.testing.expect(server.implicit_session.client_info == null);
+
+    // The point of the gate: a peer whose handshake was refused is not served.
+    const listed = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    );
+    defer listed.deinit();
+    const listed_body = listed.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, listed_body, "-32002") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed_body, "Server not initialized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed_body, "secret") == null);
+
+    // Refusing one attempt does not poison the session: a client that retries
+    // with a version this server speaks still gets in.
+    try testCompleteHandshake(&server, io);
+    try std.testing.expectEqual(SessionState.ready, server.implicit_session.state);
+    try std.testing.expectEqualStrings("c", server.implicit_session.client_info.?.name);
+}
+
+test "an initialize with no params is refused and leaves the session closed" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize"}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"result\"") == null);
+    try std.testing.expectEqual(SessionState.uninitialized, server.implicit_session.state);
+
+    const listed = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    );
+    defer listed.deinit();
+    const listed_body = listed.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, listed_body, "-32002") != null);
+}
+
+test "omitting protocolVersion cannot get around a pinned version" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pinned = [_][]const u8{"2025-11-25"};
+    var server: Server = .init(std.testing.allocator, .{
+        .name = "s",
+        .version = "1",
+        .supported_protocol_versions = &pinned,
+        .strict_protocol_version = true,
+    });
+    defer server.deinit();
+
+    // `protocolVersion` is required, so treating an absent one as "no
+    // preference" would hand the client a way to skip the pin entirely.
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32602") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"result\"") == null);
+    try std.testing.expectEqual(SessionState.uninitialized, server.implicit_session.state);
+    try std.testing.expect(server.implicit_session.client_info == null);
 }

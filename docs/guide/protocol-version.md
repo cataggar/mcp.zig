@@ -72,6 +72,12 @@ var server: mcp.Server = .init(allocator, .{
   version` (the `data` member lists what would work) instead of being
   negotiated down.
 
+`protocolVersion` is a required member of the handshake, so a request that
+omits it is answered `-32602 Invalid params` rather than being negotiated to
+the server's preferred revision — otherwise the pin could be sidestepped by
+leaving the field out. A refused handshake also leaves the session
+uninitialized, so it buys no access to the rest of the method surface.
+
 The two are independent. Pinning without `strict_protocol_version` narrows
 what the server advertises and accepts on the wire while still negotiating
 down politely; `strict_protocol_version` without pinning simply rejects
