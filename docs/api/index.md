@@ -39,6 +39,6 @@ const protocol_version = mcp.protocol.PROTOCOL_VERSION;
 
 ## Notes
 
-- Server tools/resources/prompts capabilities are enabled by registration (`addTool`, `addResource`, `addPrompt`).
+- Server tools/resources/prompts capabilities are enabled by registration (`addTool`, `addResource`, `addPrompt`). Their advertised `listChanged` flag defaults to `false` and is opt-in via the `tools_list_changed` / `resources_list_changed` / `prompts_list_changed` config options.
 - HTTP server mode accepts JSON-RPC POST requests on `/`.
 - Client APIs are currently request-oriented (`!void`) and do not block-wait for typed responses.

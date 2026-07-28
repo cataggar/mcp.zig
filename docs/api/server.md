@@ -61,7 +61,7 @@ pub fn enableCompletions(self: *Server) void
 pub fn enableTasks(self: *Server) void
 ```
 
-Tools/resources/prompts capabilities are advertised automatically once components are registered.
+Tools/resources/prompts capabilities are advertised automatically once components are registered. Their `listChanged` flag is sourced from the `tools_list_changed` / `resources_list_changed` / `prompts_list_changed` config options and defaults to `false`, because the library never emits the list-changed notification on its own. Set the matching flag when the host calls `notifyToolsChanged` / `notifyResourcesChanged` / `notifyPromptsChanged`.
 
 ## Utility Notifications
 

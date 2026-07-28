@@ -27,6 +27,9 @@ defer server.deinit();
 | instructions | ?[]const u8 | Optional server usage instructions |
 | page_size | usize | Maximum items per `*/list` response. `0` (default) returns everything in one page. |
 | max_tool_workers | usize | Threads that run `tools/call` off the message loop. `0` (default) keeps the loop strictly sequential. |
+| tools_list_changed | bool | Whether the server promises to emit `notifications/tools/list_changed`. Default `false`. |
+| resources_list_changed | bool | Whether the server promises to emit `notifications/resources/list_changed`. Default `false`. |
+| prompts_list_changed | bool | Whether the server promises to emit `notifications/prompts/list_changed`. Default `false`. |
 
 ### Pagination
 
@@ -88,7 +91,8 @@ can also be cancelled while it runs.
 
 ## Capabilities
 
-Capabilities are enabled by registration and explicit toggles:
+Registration decides whether a capability is *present*; it does not decide
+whether the server promises change notifications.
 
 ```zig
 try server.addTool(tool);
@@ -99,6 +103,39 @@ server.enableLogging();
 server.enableCompletions();
 server.enableTasks();
 ```
+
+### List-changed notifications
+
+A `listChanged` flag tells the client the server will send
+`notifications/{tools,resources,prompts}/list_changed` when its list changes,
+so the client may cache `*/list` and wait for that signal instead of polling.
+
+This library never emits those notifications on its own — they are sent only
+when the host explicitly calls `notifyToolsChanged`, `notifyResourcesChanged`
+or `notifyPromptsChanged`. So the honest default is `false`: registering a tool
+advertises the `tools` capability with `"listChanged":false`, and likewise for
+resources and prompts. Opt in only when the host actually calls the matching
+`notify*` method:
+
+```zig
+var server: mcp.Server = .init(allocator, .{
+    .name = "my-server",
+    .version = "1.0.0",
+    .tools_list_changed = true,      // I will call notifyToolsChanged
+    .resources_list_changed = true,  // I will call notifyResourcesChanged
+    .prompts_list_changed = true,    // I will call notifyPromptsChanged
+});
+```
+
+::: warning Default change
+The advertised default flipped from `true` to `false`. Earlier versions set
+`"listChanged":true` as soon as anything was registered, promising
+notifications the library never sent. If you rely on clients being told to
+watch for list changes, set the flags above and make sure the host calls the
+corresponding `notify*` method. The `tools`/`resources`/`prompts` capabilities
+are still advertised on registration exactly as before; only the `listChanged`
+value changed.
+:::
 
 ## Running the Server
 

@@ -80,6 +80,21 @@ ctx.server.notifyResourcesChanged(io, allocator) catch {};
 This triggers `notifications/resources/list_changed` on all subscribed clients,
 causing them to refresh their resource list.
 
+Because the server actually sends this notification, it advertises the
+capability honestly by opting in at construction:
+
+```zig
+var server: mcp.Server = .init(allocator, .{
+    .name = "notes-server",
+    .version = "1.0.0",
+    .resources_list_changed = true,
+});
+```
+
+Without `.resources_list_changed = true`, the advertised
+`resources.listChanged` flag defaults to `false`, so a client would not know
+to watch for the notification.
+
 ## Tools Schema
 
 All tools use `InputSchemaBuilder`:

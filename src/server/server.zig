@@ -184,6 +184,18 @@ pub const ServerConfig = struct {
     /// whether to continue. `true` fails the handshake with `-32602` instead,
     /// for a host whose behaviour is only defined on the pinned revision.
     strict_protocol_version: bool = false,
+    /// Whether the server promises to emit `notifications/tools/list_changed`.
+    /// The library never sends it by itself, so the honest default is `false`;
+    /// set it when the host calls `notifyToolsChanged`.
+    tools_list_changed: bool = false,
+    /// Whether the server promises to emit `notifications/resources/list_changed`.
+    /// The library never sends it by itself, so the honest default is `false`;
+    /// set it when the host calls `notifyResourcesChanged`.
+    resources_list_changed: bool = false,
+    /// Whether the server promises to emit `notifications/prompts/list_changed`.
+    /// The library never sends it by itself, so the honest default is `false`;
+    /// set it when the host calls `notifyPromptsChanged`.
+    prompts_list_changed: bool = false,
 };
 
 /// One page of a `*/list` response.
@@ -982,13 +994,13 @@ pub const Server = struct {
             if (parsed != .object) return error.InvalidInputSchema;
         }
         try self.tools.put(tool.name, tool);
-        self.capabilities.tools = .{ .listChanged = true };
+        self.capabilities.tools = .{ .listChanged = self.config.tools_list_changed };
     }
 
     /// Add a resource to the server
     pub fn addResource(self: *Self, resource: resources_mod.Resource) !void {
         try self.resources.put(resource.uri, resource);
-        self.capabilities.resources = .{ .listChanged = true, .subscribe = false };
+        self.capabilities.resources = .{ .listChanged = self.config.resources_list_changed, .subscribe = false };
     }
 
     /// Add a resource template to the server
@@ -1002,7 +1014,7 @@ pub const Server = struct {
     /// Add a prompt to the server
     pub fn addPrompt(self: *Self, prompt: prompts_mod.Prompt) !void {
         try self.prompts.put(prompt.name, prompt);
-        self.capabilities.prompts = .{ .listChanged = true };
+        self.capabilities.prompts = .{ .listChanged = self.config.prompts_list_changed };
     }
 
     /// Enable logging capability
@@ -3639,6 +3651,198 @@ test "Server enable capabilities" {
     try std.testing.expect(server.capabilities.logging != null);
     try std.testing.expect(server.capabilities.completions != null);
     try std.testing.expect(server.capabilities.tasks != null);
+}
+
+/// A no-op tool used by the capability tests below.
+fn capabilityTestTool(name: []const u8) tools_mod.Tool {
+    return .{
+        .name = name,
+        .description = "capability test tool",
+        .handler = struct {
+            fn handler(_: ?*anyopaque, _: std.Io, _: std.mem.Allocator, _: ?std.json.Value) !tools_mod.ToolResult {
+                return .{ .content = &.{} };
+            }
+        }.handler,
+    };
+}
+
+/// Drives a real `initialize` handshake and returns the `listChanged` flag the
+/// server advertises for `capability` on the wire, or null if the capability
+/// is absent from the response. This asserts on the emitted JSON rather than
+/// the in-memory struct, so it catches a mismatch between the two.
+fn advertisedListChanged(server: *Server, capability: []const u8) !?bool {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator, test_initialize_message);
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const result = parsed.value.object.get("result").?.object;
+    const caps = result.get("capabilities").?.object;
+    const cap = caps.get(capability) orelse return null;
+    return cap.object.get("listChanged").?.bool;
+}
+
+test "addTool advertises tools.listChanged from config, defaulting to false" {
+    // Default config: the library never emits notifications/tools/list_changed
+    // on its own, so registering a tool must advertise listChanged:false while
+    // still declaring the tools capability.
+    {
+        var server: Server = .init(std.testing.allocator, .{
+            .name = "test-server",
+            .version = "1.0.0",
+        });
+        defer server.deinit();
+
+        try server.addTool(capabilityTestTool("t"));
+        try std.testing.expect(server.capabilities.tools != null);
+
+        const advertised = try advertisedListChanged(&server, "tools");
+        try std.testing.expect(advertised != null); // capability present on the wire
+        try std.testing.expectEqual(false, advertised.?);
+    }
+
+    // Opting in flips the advertised flag to true.
+    {
+        var server: Server = .init(std.testing.allocator, .{
+            .name = "test-server",
+            .version = "1.0.0",
+            .tools_list_changed = true,
+        });
+        defer server.deinit();
+
+        try server.addTool(capabilityTestTool("t"));
+
+        const advertised = try advertisedListChanged(&server, "tools");
+        try std.testing.expect(advertised != null);
+        try std.testing.expectEqual(true, advertised.?);
+    }
+}
+
+test "addResource advertises listChanged from config and keeps subscribe false" {
+    {
+        var server: Server = .init(std.testing.allocator, .{
+            .name = "test-server",
+            .version = "1.0.0",
+        });
+        defer server.deinit();
+
+        try server.addResource(.{
+            .uri = "file:///test",
+            .name = "Test",
+            .handler = struct {
+                fn handler(_: ?*anyopaque, _: std.Io, _: std.mem.Allocator, uri: []const u8) !resources_mod.ResourceContent {
+                    return .{ .uri = uri };
+                }
+            }.handler,
+        });
+        try std.testing.expect(server.capabilities.resources != null);
+        // subscribe must keep its historical value regardless of the flag.
+        try std.testing.expectEqual(false, server.capabilities.resources.?.subscribe);
+
+        const advertised = try advertisedListChanged(&server, "resources");
+        try std.testing.expect(advertised != null);
+        try std.testing.expectEqual(false, advertised.?);
+    }
+
+    {
+        var server: Server = .init(std.testing.allocator, .{
+            .name = "test-server",
+            .version = "1.0.0",
+            .resources_list_changed = true,
+        });
+        defer server.deinit();
+
+        try server.addResource(.{
+            .uri = "file:///test",
+            .name = "Test",
+            .handler = struct {
+                fn handler(_: ?*anyopaque, _: std.Io, _: std.mem.Allocator, uri: []const u8) !resources_mod.ResourceContent {
+                    return .{ .uri = uri };
+                }
+            }.handler,
+        });
+        // Opting into list-changed must not turn subscribe on.
+        try std.testing.expectEqual(false, server.capabilities.resources.?.subscribe);
+
+        const advertised = try advertisedListChanged(&server, "resources");
+        try std.testing.expect(advertised != null);
+        try std.testing.expectEqual(true, advertised.?);
+    }
+}
+
+test "addPrompt advertises prompts.listChanged from config, defaulting to false" {
+    {
+        var server: Server = .init(std.testing.allocator, .{
+            .name = "test-server",
+            .version = "1.0.0",
+        });
+        defer server.deinit();
+
+        try server.addPrompt(.{
+            .name = "test_prompt",
+            .description = "A test prompt",
+            .handler = struct {
+                fn handler(_: ?*anyopaque, _: std.Io, _: std.mem.Allocator, _: ?std.json.Value) ![]const prompts_mod.PromptMessage {
+                    return &.{};
+                }
+            }.handler,
+        });
+        try std.testing.expect(server.capabilities.prompts != null);
+
+        const advertised = try advertisedListChanged(&server, "prompts");
+        try std.testing.expect(advertised != null);
+        try std.testing.expectEqual(false, advertised.?);
+    }
+
+    {
+        var server: Server = .init(std.testing.allocator, .{
+            .name = "test-server",
+            .version = "1.0.0",
+            .prompts_list_changed = true,
+        });
+        defer server.deinit();
+
+        try server.addPrompt(.{
+            .name = "test_prompt",
+            .description = "A test prompt",
+            .handler = struct {
+                fn handler(_: ?*anyopaque, _: std.Io, _: std.mem.Allocator, _: ?std.json.Value) ![]const prompts_mod.PromptMessage {
+                    return &.{};
+                }
+            }.handler,
+        });
+
+        const advertised = try advertisedListChanged(&server, "prompts");
+        try std.testing.expect(advertised != null);
+        try std.testing.expectEqual(true, advertised.?);
+    }
+}
+
+test "registering a tool does not clobber the configured list-changed flag" {
+    // The old bug: every addTool overwrote the whole capability struct with a
+    // hardcoded listChanged:true, so the flag depended on registration order
+    // and a host could not keep it at its configured value. Here the config
+    // (default false) must survive repeated registration.
+    var server: Server = .init(std.testing.allocator, .{
+        .name = "test-server",
+        .version = "1.0.0",
+    });
+    defer server.deinit();
+
+    try server.addTool(capabilityTestTool("a"));
+    try server.addTool(capabilityTestTool("b"));
+
+    try std.testing.expectEqual(false, server.capabilities.tools.?.listChanged);
+
+    const advertised = try advertisedListChanged(&server, "tools");
+    try std.testing.expect(advertised != null);
+    try std.testing.expectEqual(false, advertised.?);
 }
 
 test "HttpRequestTransport response outlives the per-message arena" {
