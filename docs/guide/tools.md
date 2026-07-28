@@ -67,6 +67,35 @@ try server.addTool(.{
 });
 ```
 
+### Supplying a schema you already have
+
+`inputSchema` covers `type`, `properties`, `required`, `description` and
+`$schema`. JSON Schema says a great deal more than that, so a schema you
+already have — authored as JSON, pasted from a specification, or kept in a
+file — can be handed over verbatim instead:
+
+```zig
+try server.addTool(.{
+    .name = "greet",
+    .description = "Greet a person",
+    .handler = greetHandler,
+    .input_schema_json =
+    \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}
+    ,
+});
+```
+
+Everything you write is republished exactly as written, so keywords the
+struct cannot express — `additionalProperties`, top-level `oneOf`, `$defs`,
+`title`, `default` — reach the client intact. `additionalProperties: false`
+in particular is how you tell a model that a misspelt argument name is an
+error rather than an ignored extra.
+
+`input_schema_json` takes precedence when both are set. The text is parsed
+once by `addTool`, which returns `error.InvalidInputSchema` if it is not a
+JSON object, so a malformed schema fails at registration rather than
+reaching a client.
+
 ## Argument Helpers
 
 ### Get String Argument

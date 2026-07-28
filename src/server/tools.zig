@@ -39,6 +39,9 @@ pub const Tool = struct {
     description: ?[]const u8 = null,
     title: ?[]const u8 = null,
     inputSchema: ?types.InputSchema = null,
+    /// A JSON Schema document supplied verbatim, for anything `inputSchema`
+    /// cannot express. Takes precedence over `inputSchema` when both are set.
+    input_schema_json: ?[]const u8 = null,
     outputSchema: ?types.OutputSchema = null,
     execution: ?types.ToolExecution = null,
     icons: ?[]const types.Icon = null,
