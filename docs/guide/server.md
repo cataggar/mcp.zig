@@ -227,6 +227,21 @@ fn toolHandler(_: ?*anyopaque, _: std.Io, allocator: Allocator, args: ?std.json.
 }
 ```
 
+### Initialization happens once
+
+A session that has completed its handshake refuses a second `initialize` with
+`-32600 Session already initialized`, and its state, negotiated protocol
+version and `clientInfo` are left untouched.
+
+The lifecycle has exactly one initialization phase, so a replay is undefined
+input. Acting on it would take a working session out of service until another
+`notifications/initialized` arrived, and would let a peer renegotiate terms
+both sides had already been trading under.
+
+A retry that arrives *before* the handshake completes is still accepted — the
+first reply may simply have been lost, and nothing has been agreed that a
+retry could damage.
+
 ### Request ids
 
 A JSON-RPC id identifies one exchange, so the server tracks the ids it is

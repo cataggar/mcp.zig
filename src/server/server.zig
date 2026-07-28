@@ -2372,6 +2372,22 @@ pub const Server = struct {
 
     /// Handle initialize request
     fn handleInitialize(self: *Self, session: *Session, io: std.Io, allocator: std.mem.Allocator, request: jsonrpc.Request) !void {
+        // There is one initialization phase, so a second one is undefined
+        // input. Acting on it would take a working session out of service and
+        // renegotiate terms the peers have already been trading under. A retry
+        // while still initializing is legitimate — the reply may simply have
+        // been lost — and there is no established state to protect yet.
+        if (session.state == .ready) {
+            const error_response = jsonrpc.createErrorResponse(
+                request.id,
+                jsonrpc.ErrorCode.INVALID_REQUEST,
+                "Session already initialized",
+                null,
+            );
+            try self.sendResponse(session, io, allocator, .{ .error_response = error_response });
+            return;
+        }
+
         session.state = .initializing;
 
         if (request.params) |params| {
@@ -5395,6 +5411,68 @@ test "a tool that runs and fails is still reported as a result" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "ExecutionFailed") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"error\"") == null);
+}
+
+/// Completes the handshake, so the session reaches `.ready` the way a real
+/// client leaves it.
+fn testCompleteHandshake(server: *Server, io: std.Io) !void {
+    try testInitialize(server, io);
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    );
+    reply.deinit();
+}
+
+test "a replayed initialize on a ready session is refused" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try testCompleteHandshake(&server, io);
+    try std.testing.expectEqual(SessionState.ready, server.implicit_session.state);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":9,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"impostor","version":"9"}}}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32600") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "already initialized") != null);
+
+    // The session is untouched: still in service, still attributed to the
+    // client that actually performed the handshake.
+    try std.testing.expectEqual(SessionState.ready, server.implicit_session.state);
+    try std.testing.expectEqualStrings("c", server.implicit_session.client_info.?.name);
+
+    const ping = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":10,"method":"ping"}
+    );
+    defer ping.deinit();
+    const ping_body = ping.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, ping_body, "\"result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ping_body, "-32002") == null);
+}
+
+test "an initialize retry before the handshake completes is still accepted" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try testInitialize(&server, io);
+
+    // The first reply may simply have been lost, and nothing has been agreed
+    // that a retry could damage.
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "-32600") == null);
 }
 
 test "a raw input schema reaches the client with every keyword intact" {
