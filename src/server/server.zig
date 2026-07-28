@@ -980,6 +980,16 @@ pub const Server = struct {
 
     /// Add a tool to the server
     pub fn addTool(self: *Self, tool: tools_mod.Tool) !void {
+        // Validate once here rather than at every tools/list, so a malformed
+        // schema is a registration failure the author sees instead of
+        // something a client discovers.
+        if (tool.input_schema_json) |raw| {
+            var arena: std.heap.ArenaAllocator = .init(self.allocator);
+            defer arena.deinit();
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{}) catch
+                return error.InvalidInputSchema;
+            if (parsed != .object) return error.InvalidInputSchema;
+        }
         try self.tools.put(tool.name, tool);
         self.capabilities.tools = .{ .listChanged = true };
     }
@@ -2518,6 +2528,15 @@ pub const Server = struct {
             }
             if (entry.value_ptr.icons) |icons| {
                 try putIcons(allocator, &tool_obj, icons);
+            }
+
+            // A schema supplied as text is republished exactly as written, so
+            // no keyword is quietly dropped on its way to the client.
+            if (entry.value_ptr.input_schema_json) |raw| {
+                const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, raw, .{});
+                try tool_obj.put(allocator, "inputSchema", parsed);
+                try tools_array.append(.{ .object = tool_obj });
+                continue;
             }
 
             var input_schema: std.json.ObjectMap = .empty;
@@ -5376,4 +5395,79 @@ test "a tool that runs and fails is still reported as a result" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"isError\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "ExecutionFailed") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"error\"") == null);
+}
+
+test "a raw input schema reaches the client with every keyword intact" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try server.addTool(.{
+        .name = "strict",
+        .description = "x",
+        .handler = testNoopTool,
+        .input_schema_json =
+        \\{"type":"object","properties":{"q":{"type":"string"}},"required":["q"],"additionalProperties":false,"title":"Strict"}
+        ,
+    });
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    // The struct form can say none of these.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"additionalProperties\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"title\":\"Strict\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"required\":[\"q\"]") != null);
+}
+
+test "a raw input schema wins over the struct form" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+    try server.addTool(.{
+        .name = "both",
+        .description = "x",
+        .handler = testNoopTool,
+        .inputSchema = .{ .description = "from the struct" },
+        .input_schema_json =
+        \\{"type":"object","description":"from the text"}
+        ,
+    });
+    try testInitialize(&server, io);
+
+    const reply = try server.handleMessageAlloc(io, std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer reply.deinit();
+    const body = reply.response() orelse return error.NoResponse;
+    try std.testing.expect(std.mem.indexOf(u8, body, "from the text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "from the struct") == null);
+}
+
+test "a malformed raw input schema is refused at registration" {
+    var server: Server = .init(std.testing.allocator, .{ .name = "s", .version = "1" });
+    defer server.deinit();
+
+    try std.testing.expectError(error.InvalidInputSchema, server.addTool(.{
+        .name = "bad",
+        .description = "x",
+        .handler = testNoopTool,
+        .input_schema_json = "{not json",
+    }));
+    // A schema that parses but is not a schema is refused too.
+    try std.testing.expectError(error.InvalidInputSchema, server.addTool(.{
+        .name = "also-bad",
+        .description = "x",
+        .handler = testNoopTool,
+        .input_schema_json = "[]",
+    }));
+    try std.testing.expectEqual(@as(usize, 0), server.tools.count());
 }
