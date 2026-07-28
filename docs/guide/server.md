@@ -242,6 +242,20 @@ A retry that arrives *before* the handshake completes is still accepted — the
 first reply may simply have been lost, and nothing has been agreed that a
 retry could damage.
 
+### A refused handshake leaves the server closed
+
+Until a session has initialized, every method other than `initialize` is
+answered `-32002 Server not initialized`. A handshake that the server *rejects*
+does not lift that: `initialize` validates before it mutates, so an attempt that
+is answered with an error leaves the session state and `clientInfo` exactly as
+they were, and the next non-`initialize` request is still refused. A client that
+then retries with terms the server accepts gets in normally.
+
+`initialize` requires `params` carrying a string `protocolVersion`; a request
+missing either is answered `-32602 Invalid params`. Accepting one without a
+version would also make [`strict_protocol_version`](./protocol-version.md)
+avoidable by simply leaving the field out.
+
 ### Request ids
 
 A JSON-RPC id identifies one exchange, so the server tracks the ids it is
