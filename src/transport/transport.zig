@@ -744,7 +744,7 @@ test "HttpTransport sends credentials and records the issued session id" {
     try transport_impl.send(io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
 
     try std.testing.expectEqual(@as(usize, 1), origin.captured_count);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "authorization: Bearer test-token") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "authorization: Bearer test-token") != null);
 
     // The id the server issued must be recorded for subsequent requests.
     try std.testing.expectEqualStrings("issued-session", transport_impl.session_id.?);
@@ -808,8 +808,8 @@ test "HttpTransport refuses to follow a redirect" {
     // Exactly one hop: the redirect was never followed, so the credentials
     // were never offered to the redirect target.
     try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "authorization:") != null);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "mcp-session-id:") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "authorization:") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "mcp-session-id:") != null);
 
     // Nothing was queued from a failed request.
     try std.testing.expectEqual(@as(usize, 0), transport_impl.pending_responses.items.len);
@@ -874,7 +874,7 @@ test "Client.connectHttp round-trips and frees everything it allocates" {
 
     try std.testing.expectEqual(@as(usize, 3), origin.requestCount());
     // The handshake response carried a session id; later requests replay it.
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[2], "mcp-session-id: issued-session") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[2], "mcp-session-id: issued-session") != null);
 }
 
 fn stdioFromFixture(dir: std.Io.Dir, io: std.Io, name: []const u8, contents: []const u8) !std.Io.File {
@@ -1011,8 +1011,8 @@ test "HttpTransport sends caller-supplied headers" {
     try transport_impl.send(io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
 
     try std.testing.expectEqual(@as(usize, 1), origin.captured_count);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "x-api-key: sekrit") != null);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(origin.captured[0], "x-tenant: acme") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "x-api-key: sekrit") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "x-tenant: acme") != null);
 }
 
 test "HttpTransport rejects headers it builds itself" {

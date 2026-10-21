@@ -3319,7 +3319,7 @@ pub const Server = struct {
 
     /// Send a log message notification
     pub fn sendLogMessage(self: *Self, io: std.Io, allocator: std.mem.Allocator, level: protocol.LogLevel, message: []const u8) !void {
-        if (@intFromEnum(level) < @intFromEnum(self.implicit_session.log_level)) return;
+        if (@backingInt(level) < @backingInt(self.implicit_session.log_level)) return;
 
         var params: std.json.ObjectMap = .empty;
         try params.put(allocator, "level", .{ .string = level.toString() });
@@ -3966,7 +3966,7 @@ test "HttpRunConfig requires opt-in for a non-loopback bind" {
     );
     try std.testing.expectError(
         error.NonLoopbackBindRequiresOptIn,
-        (Server.HttpRunConfig{ .host = "0.0.0.0", .auth_token = "x" ** 32 }).validate(),
+        (Server.HttpRunConfig{ .host = "0.0.0.0", .auth_token = &@as([32]u8, @splat('x')) }).validate(),
     );
 }
 
@@ -3980,7 +3980,7 @@ test "HttpRunConfig requires a token once a non-loopback bind is opted into" {
     try (Server.HttpRunConfig{
         .host = "0.0.0.0",
         .allow_non_loopback = true,
-        .auth_token = "x" ** 32,
+        .auth_token = &@as([32]u8, @splat('x')),
     }).validate();
 }
 
@@ -3995,10 +3995,10 @@ test "HttpRunConfig rejects a short token even on loopback" {
         (Server.HttpRunConfig{
             .host = "0.0.0.0",
             .allow_non_loopback = true,
-            .auth_token = "x" ** 31,
+            .auth_token = &@as([31]u8, @splat('x')),
         }).validate(),
     );
-    try (Server.HttpRunConfig{ .auth_token = "x" ** 32 }).validate();
+    try (Server.HttpRunConfig{ .auth_token = &@as([32]u8, @splat('x')) }).validate();
 }
 
 test "originIsAllowed matches only listed origins" {

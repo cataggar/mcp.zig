@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
 
         const run_artifact = b.addRunArtifact(exe);
-        if (b.args) |args| run_artifact.addArgs(args);
+        run_artifact.addPassthruArgs();
 
         const run_step = b.step(ex.run_step, ex.desc);
         run_step.dependOn(&run_artifact.step);

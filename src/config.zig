@@ -248,7 +248,7 @@ fn inferTransport(
         // the same two transports; rejecting them would be pedantry.
         if (eqlAny(v, &.{ "stdio", "local" })) return .stdio;
         if (eqlAny(v, &.{ "http", "streamable-http", "streamablehttp", "remote" })) return .http;
-        if (eqlAny(v, &.{ "sse" })) return .sse;
+        if (eqlAny(v, &.{"sse"})) return .sse;
         try b.note("{s}: mcpServers.{s}.type has unsupported value \"{s}\"", .{ b.source, name, v });
         return error.InvalidEntry;
     }
