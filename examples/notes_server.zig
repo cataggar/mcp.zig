@@ -75,6 +75,10 @@ fn run(io: std.Io, allocator: std.mem.Allocator) !void {
         .title = "Note-Taking Server",
         .description = "Create, read, and delete in-memory text notes",
         .instructions = "Use create_note, read_note, delete_note, and list_notes.",
+        // This server calls notifyResourcesChanged when a note is added or
+        // removed, so it honestly advertises the resource list-changed
+        // capability. Without this the flag defaults to false.
+        .resources_list_changed = true,
     });
     defer server.deinit();
 

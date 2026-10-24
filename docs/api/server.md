@@ -35,7 +35,14 @@ Run options:
 | `.stdio` | Line-delimited JSON-RPC over stdin/stdout |
 | `.{ .http = .{ .host = "localhost", .port = 8080 } }` | HTTP listener with JSON-RPC POST on `/` |
 
-Note: HTTP mode accepts host names such as `localhost` and binds to loopback when appropriate.
+Note: HTTP mode binds loopback by default. Binding any other address requires
+`.allow_non_loopback = true` **and** an `.auth_token` of at least 32
+characters; otherwise `run` fails with `NonLoopbackBindRequiresOptIn` or
+`NonLoopbackBindRequiresAuthToken` before the listener is created. When
+`auth_token` is set, every request must present `Authorization: Bearer <token>`
+or receive `401`. Requests carrying an `Origin` header are rejected with `403`
+unless the origin appears in `allowed_origins` (empty by default), and every
+request must declare `Content-Type: application/json` or receive `415`.
 
 ## Registration
 
@@ -54,7 +61,7 @@ pub fn enableCompletions(self: *Server) void
 pub fn enableTasks(self: *Server) void
 ```
 
-Tools/resources/prompts capabilities are advertised automatically once components are registered.
+Tools/resources/prompts capabilities are advertised automatically once components are registered. Their `listChanged` flag is sourced from the `tools_list_changed` / `resources_list_changed` / `prompts_list_changed` config options and defaults to `false`, because the library never emits the list-changed notification on its own. Set the matching flag when the host calls `notifyToolsChanged` / `notifyResourcesChanged` / `notifyPromptsChanged`.
 
 ## Utility Notifications
 

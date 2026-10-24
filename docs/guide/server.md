@@ -25,10 +25,74 @@ defer server.deinit();
 | icons | ?[]const mcp.types.Icon | Optional icon list |
 | websiteUrl | ?[]const u8 | Optional website URL |
 | instructions | ?[]const u8 | Optional server usage instructions |
+| page_size | usize | Maximum items per `*/list` response. `0` (default) returns everything in one page. |
+| max_tool_workers | usize | Threads that run `tools/call` off the message loop. `0` (default) keeps the loop strictly sequential. |
+| tools_list_changed | bool | Whether the server promises to emit `notifications/tools/list_changed`. Default `false`. |
+| resources_list_changed | bool | Whether the server promises to emit `notifications/resources/list_changed`. Default `false`. |
+| prompts_list_changed | bool | Whether the server promises to emit `notifications/prompts/list_changed`. Default `false`. |
+
+### Pagination
+
+With `page_size` set, `tools/list`, `resources/list`,
+`resources/templates/list` and `prompts/list` return at most that many items
+and a `nextCursor`, which the client passes back as `params.cursor`.
+
+Entries are ordered by name before paging. Hash map iteration order is not
+stable across insertions, so paging over the raw order could skip or repeat
+entries whenever a component is registered mid-walk; a total order makes
+"everything after X" well defined regardless. It also means a cursor whose key
+has since been removed resumes correctly instead of stranding the walk.
+
+Cursors are opaque (base64url of an internal key). One the server never issued
+is answered with `-32602 Invalid cursor`; it does not drop the connection.
+
+`page_size = 0` is the historical behaviour and never emits `nextCursor`.
+
+### Concurrent tool calls
+
+By default the message loop is strictly sequential: a tool that takes ten
+seconds to answer stalls every request behind it, including `ping` and
+`notifications/cancelled`. Setting `max_tool_workers` starts that many threads
+and routes `tools/call` requests to them:
+
+```zig
+var server = mcp.Server.init(allocator, .{
+    .name = "my-server",
+    .version = "1.0.0",
+    .max_tool_workers = 4,
+});
+```
+
+Only `tools/call` is moved off the loop. Everything else — the handshake,
+`ping`, cancellations — is still handled inline, so ordering during
+initialization is preserved and a cancellation never queues up behind the call
+it is meant to stop.
+
+Admission is bounded rather than queued. When every worker is occupied the
+next tool call is answered immediately with `-32000 Server busy` instead of
+waiting in a queue the client cannot see:
+
+```json
+{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"Server busy",
+ "data":"all tool workers are occupied"}}
+```
+
+A client that gets this should retry; it means the server is saturated, not
+that the request was wrong. Pick `max_tool_workers` to match how many tool
+invocations you are willing to have running at once — an unbounded pool would
+just move the failure from a clear error into memory exhaustion.
+
+Writes to the transport are serialized, so replies from workers never
+interleave with each other or with the loop. Responses may of course arrive
+out of request order; JSON-RPC ids are what pair a response to its request.
+
+Combine this with [contextual tool handlers](tools.md) so a long-running tool
+can also be cancelled while it runs.
 
 ## Capabilities
 
-Capabilities are enabled by registration and explicit toggles:
+Registration decides whether a capability is *present*; it does not decide
+whether the server promises change notifications.
 
 ```zig
 try server.addTool(tool);
@@ -39,6 +103,39 @@ server.enableLogging();
 server.enableCompletions();
 server.enableTasks();
 ```
+
+### List-changed notifications
+
+A `listChanged` flag tells the client the server will send
+`notifications/{tools,resources,prompts}/list_changed` when its list changes,
+so the client may cache `*/list` and wait for that signal instead of polling.
+
+This library never emits those notifications on its own — they are sent only
+when the host explicitly calls `notifyToolsChanged`, `notifyResourcesChanged`
+or `notifyPromptsChanged`. So the honest default is `false`: registering a tool
+advertises the `tools` capability with `"listChanged":false`, and likewise for
+resources and prompts. Opt in only when the host actually calls the matching
+`notify*` method:
+
+```zig
+var server: mcp.Server = .init(allocator, .{
+    .name = "my-server",
+    .version = "1.0.0",
+    .tools_list_changed = true,      // I will call notifyToolsChanged
+    .resources_list_changed = true,  // I will call notifyResourcesChanged
+    .prompts_list_changed = true,    // I will call notifyPromptsChanged
+});
+```
+
+::: warning Default change
+The advertised default flipped from `true` to `false`. Earlier versions set
+`"listChanged":true` as soon as anything was registered, promising
+notifications the library never sent. If you rely on clients being told to
+watch for list changes, set the flags above and make sure the host calls the
+corresponding `notify*` method. The `tools`/`resources`/`prompts` capabilities
+are still advertised on registration exactly as before; only the `listChanged`
+value changed.
+:::
 
 ## Running the Server
 
@@ -52,19 +149,73 @@ try server.run(io, allocator, .stdio);
 
 ### HTTP Transport
 
-For remote access:
+For local access over HTTP:
 
 ```zig
 try server.run(io, allocator, .{ .http = .{ .host = "127.0.0.1", .port = 8080 } });
 ```
 
-You can also bind custom domains/hosts and ports:
+Binding anything other than loopback is opt-in and must be authenticated,
+because an MCP server exposes every tool you have registered to whoever can
+reach the port:
 
 ```zig
-try server.run(io, allocator, .{ .http = .{ .host = "api.example.com", .port = 8443 } });
+try server.run(io, allocator, .{ .http = .{
+    .host = "0.0.0.0",
+    .port = 8443,
+    .allow_non_loopback = true,
+    .auth_token = my_secret, // at least 32 characters
+} });
 ```
 
+Clients must then send `Authorization: Bearer <token>` on every request;
+anything else is answered with `401`. A configuration that would expose tools
+without authentication is rejected before the listener is created, so the
+server refuses to start rather than starting insecurely.
+
+Requests are also screened for browser origin. Anything carrying an `Origin`
+header is rejected with `403` unless listed in `allowed_origins`, and the body
+must be declared `application/json` or the request is rejected with `415`:
+
+```zig
+try server.run(io, allocator, .{ .http = .{
+    .port = 8080,
+    .allowed_origins = &.{"https://app.example.com"},
+} });
+```
+
+Ordinary MCP clients are not browsers and send no `Origin`, so the empty
+default is transparent for them while closing the door on web pages the user
+happens to visit. Binding loopback is no defence here, because such a request
+comes from the victim's own machine.
+
 The HTTP mode accepts JSON-RPC POST requests at the root path.
+
+### Driving the server yourself
+
+If your program already owns its I/O — an editor extension, an existing HTTP
+stack, or a test — you do not need a transport at all. `handleMessageAlloc`
+takes one JSON-RPC message and returns everything the server produced:
+
+```zig
+const reply = try server.handleMessageAlloc(io, allocator, line);
+defer reply.deinit();
+
+if (reply.response()) |body| {
+    // A request: `body` is the JSON-RPC response.
+    try out.writeAll(body);
+} else {
+    // A notification: the server produced nothing to send back.
+}
+```
+
+`Reply.messages` holds every message in the order the server produced it, so a
+handler that emits progress notifications before its result is preserved
+faithfully; `Reply.response()` is a convenience for the last one. All bytes are
+allocated from the allocator you pass and freed by `reply.deinit()`.
+
+This uses the implicit session, the same one stdio and custom transports use,
+so the handshake and session state behave exactly as they do under `run`.
 
 ## Registering Components
 
@@ -112,6 +263,84 @@ fn toolHandler(_: ?*anyopaque, _: std.Io, allocator: Allocator, args: ?std.json.
     return mcp.tools.textResult(allocator, message) catch return mcp.tools.ToolError.OutOfMemory;
 }
 ```
+
+### Initialization happens once
+
+A session that has completed its handshake refuses a second `initialize` with
+`-32600 Session already initialized`, and its state, negotiated protocol
+version and `clientInfo` are left untouched.
+
+The lifecycle has exactly one initialization phase, so a replay is undefined
+input. Acting on it would take a working session out of service until another
+`notifications/initialized` arrived, and would let a peer renegotiate terms
+both sides had already been trading under.
+
+A retry that arrives *before* the handshake completes is still accepted — the
+first reply may simply have been lost, and nothing has been agreed that a
+retry could damage.
+
+### A refused handshake leaves the server closed
+
+Until a session has initialized, every method other than `initialize` is
+answered `-32002 Server not initialized`. A handshake that the server *rejects*
+does not lift that: `initialize` validates before it mutates, so an attempt that
+is answered with an error leaves the session state and `clientInfo` exactly as
+they were, and the next non-`initialize` request is still refused. A client that
+then retries with terms the server accepts gets in normally.
+
+`initialize` requires `params` carrying a string `protocolVersion`; a request
+missing either is answered `-32602 Invalid params`. Accepting one without a
+version would also make [`strict_protocol_version`](./protocol-version.md)
+avoidable by simply leaving the field out.
+
+### Request ids
+
+A JSON-RPC id identifies one exchange, so the server tracks the ids it is
+currently serving. A request that reuses an id while the original is still
+outstanding is answered with `-32600 Duplicate request id` — otherwise two
+responses would carry the same id and the client could not tell them apart.
+
+The id is released as soon as its response is sent, so ordinary clients that
+count from 1 and reuse ids across reconnects are unaffected; only genuinely
+concurrent reuse is rejected. At most `Session.max_inflight_requests` (256)
+requests may be in flight on one session; beyond that the server answers
+`-32603 Too many requests in flight`.
+
+### Methods outside the specification
+
+A host built on this library may need methods MCP does not define — a
+lifecycle `shutdown`, an editor-specific query, an internal health probe.
+Register them rather than forking the dispatch:
+
+```zig
+fn shutdown(ctx: ?*anyopaque, _: std.Io, allocator: Allocator, _: ?std.json.Value) anyerror!std.json.Value {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    app.stop();
+
+    var result: std.json.ObjectMap = .empty;
+    try result.put(allocator, "stopped", .{ .bool = true });
+    return .{ .object = result };
+}
+
+try server.onMethod("shutdown", &app, shutdown);
+try server.onNotificationMethod("exit", &app, exit);
+```
+
+The returned `std.json.Value` becomes the JSON-RPC `result`, allocated from
+the per-message arena. A handler that returns an error is answered `-32603`
+with the error name, so a failing custom method cannot take the connection
+down. A notification handler has nothing to reply to, so a failure is logged.
+
+Three rules keep the registry from becoming a way to break the protocol:
+
+- **Built-ins win, and cannot be shadowed.** The registry is consulted only
+  after every specification method has declined. Registering a name the server
+  answers itself returns `error.MethodReserved` — a registration that silently
+  never runs is a worse outcome than being told no.
+- **An unregistered method still answers `-32601`.** Nothing changes for
+  clients that only speak MCP.
+- **Registering the same method twice replaces the handler**, so re-registering
+  during reconfiguration is safe.
 
 ## Complete Example
 

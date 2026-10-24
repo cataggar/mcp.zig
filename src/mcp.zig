@@ -65,6 +65,7 @@ pub const Server = server.Server;
 pub const ServerConfig = server.ServerConfig;
 
 pub const tools = @import("server/tools.zig");
+pub const RequestContext = @import("server/request.zig").RequestContext;
 pub const Tool = tools.Tool;
 pub const ToolBuilder = tools.ToolBuilder;
 pub const ToolResult = tools.ToolResult;
@@ -81,11 +82,20 @@ pub const PromptMessage = prompts.PromptMessage;
 pub const client = @import("client/client.zig");
 pub const Client = client.Client;
 pub const ClientConfig = client.ClientConfig;
+pub const Response = client.Response;
+pub const ServerError = client.ServerError;
 pub const elicitation = @import("client/elicitation.zig");
 pub const roots = @import("client/roots.zig");
 pub const sampling = @import("client/sampling.zig");
 
 // Utilities
+pub const config = @import("config.zig");
+pub const ServerSpec = config.ServerSpec;
+
+pub const host = @import("host.zig");
+pub const Host = host.Host;
+pub const HostConfig = host.HostConfig;
+
 pub const utils = @import("utils/mod.zig");
 pub const errors = @import("utils/errors.zig");
 pub const logging = @import("utils/logging.zig");

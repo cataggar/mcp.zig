@@ -23,8 +23,9 @@ pub const Level = enum(u8) {
 
     /// Parses a log level from its string representation.
     pub fn fromString(str: []const u8) ?Level {
-        inline for (std.meta.fields(Level)) |f| {
-            if (std.mem.eql(u8, f.name, str)) return @enumFromInt(f.value);
+        const type_info = @typeInfo(Level).@"enum";
+        inline for (type_info.field_names, type_info.field_values) |name, value| {
+            if (std.mem.eql(u8, name, str)) return @fromBackingInt(@intCast(value));
         }
         return null;
     }
@@ -68,7 +69,7 @@ pub const Logger = struct {
 
     /// Logs a message at the specified level.
     pub fn log(self: *Logger, level: Level, message: []const u8) void {
-        if (@intFromEnum(level) > @intFromEnum(self.config.level)) return;
+        if (@backingInt(level) > @backingInt(self.config.level)) return;
 
         if (self.config.stderr) {
             std.debug.print("[{s}] {s}\n", .{ level.toString(), message });

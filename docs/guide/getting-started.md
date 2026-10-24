@@ -66,8 +66,11 @@ pub fn main(init: std.process.Init) void {
 }
 
 fn run(io: std.Io, allocator: std.mem.Allocator) !void {
-    // Check for library updates in background (recommended)
-    if (mcp.report.checkForUpdates(io, allocator)) |t| t.detach();
+    // Optional: check GitHub Releases for a newer mcp.zig. This performs
+    // network I/O and the thread borrows `allocator`, so join it rather than
+    // detaching -- a detached worker can outlive the allocator it is using.
+    const update_thread = mcp.report.checkForUpdates(io, allocator);
+    defer if (update_thread) |t| t.join();
 
     // Create a server
     var server: mcp.Server = .init(allocator, .{

@@ -30,7 +30,7 @@ var client: mcp.Client = .init(io, allocator, .{
     .name = "my-client",
     .version = "1.0.0",
 });
-defer client.deinit(allocator);
+defer client.deinit(io, allocator);
 ```
 
 ---
@@ -60,6 +60,37 @@ pub fn enableTasks(self: *Client) void
 pub fn enableTasksAdvanced(self: *Client, sampling: bool, elicitation: bool) void
 ```
 
+`initialize` fails with `error.MissingSamplingHandler` /
+`error.MissingElicitationHandler` if those capabilities are enabled without a
+matching handler. `roots` has a built-in handler and needs none.
+
+---
+
+## Server-Initiated Traffic
+
+```zig
+pub const RequestHandler = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!std.json.Value;
+
+pub const NotificationHandler = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    params: ?std.json.Value,
+) anyerror!void;
+
+pub fn onRequest(self: *Client, allocator: std.mem.Allocator, method: []const u8, ctx: ?*anyopaque, handler: RequestHandler) !void
+pub fn onNotification(self: *Client, allocator: std.mem.Allocator, method: []const u8, ctx: ?*anyopaque, handler: NotificationHandler) !void
+pub fn hasRequestHandler(self: *const Client, method: []const u8) bool
+```
+
+`allocator` is an arena freed once the reply is serialized. Unhandled requests
+are answered `-32601`; failing handlers are answered `-32603`.
+
 ---
 
 ## Roots Management
@@ -76,36 +107,62 @@ pub fn addRoot(self: *Client, allocator: std.mem.Allocator, uri: []const u8, nam
 pub fn connectStdio(self: *Client, io: std.Io, allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) !void
 pub fn connectHttp(self: *Client, io: std.Io, allocator: std.mem.Allocator, url: []const u8) !void
 pub fn setAuthorizationToken(self: *Client, allocator: std.mem.Allocator, token: []const u8) !void
-pub fn disconnect(self: *Client) void
+pub fn disconnect(self: *Client, io: std.Io) void
 ```
 
 ---
 
 ## Request APIs
 
-All request APIs currently send protocol requests and return `!void`.
+Every request API sends the request, waits for the matching response, and
+returns it. The caller owns the `Response` and must `deinit` it.
 
 ```zig
-pub fn listTools(self: *Client, io: std.Io, allocator: std.mem.Allocator) !void
-pub fn callTool(self: *Client, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !void
+pub const Response = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    /// The `result` member. A view into `parsed`, valid until `deinit`.
+    result: std.json.Value,
 
-pub fn listResources(self: *Client, io: std.Io, allocator: std.mem.Allocator) !void
-pub fn readResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !void
-pub fn subscribeResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !void
-pub fn unsubscribeResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !void
-pub fn listResourceTemplates(self: *Client, io: std.Io, allocator: std.mem.Allocator) !void
+    pub fn deinit(self: Response) void;
+    /// Field of the result object, or null.
+    pub fn get(self: Response, name: []const u8) ?std.json.Value;
+};
+```
 
-pub fn listPrompts(self: *Client, io: std.Io, allocator: std.mem.Allocator) !void
-pub fn getPrompt(self: *Client, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !void
+A JSON-RPC error response returns `error.ServerError`; the code and message are
+then available in `client.last_error`.
 
-pub fn complete(self: *Client, io: std.Io, allocator: std.mem.Allocator, ref: std.json.Value, argument: std.json.Value) !void
-pub fn setLogLevel(self: *Client, io: std.Io, allocator: std.mem.Allocator, level: []const u8) !void
-pub fn ping(self: *Client, io: std.Io, allocator: std.mem.Allocator) !void
+```zig
+pub fn listTools(self: *Client, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response
+pub fn callTool(self: *Client, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !Response
 
-pub fn getTask(self: *Client, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !void
-pub fn getTaskResult(self: *Client, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !void
-pub fn listTasks(self: *Client, io: std.Io, allocator: std.mem.Allocator) !void
-pub fn cancelTask(self: *Client, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !void
+pub fn listResources(self: *Client, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response
+pub fn readResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response
+pub fn subscribeResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response
+pub fn unsubscribeResource(self: *Client, io: std.Io, allocator: std.mem.Allocator, uri: []const u8) !Response
+pub fn listResourceTemplates(self: *Client, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response
+
+pub fn listPrompts(self: *Client, io: std.Io, allocator: std.mem.Allocator, options: ListOptions) !Response
+
+// Walk every page. Prefer these unless you are driving the paging yourself:
+// a bare `list*` call returns only the first page, and against a paginating
+// server that is silent data loss.
+pub fn listAllTools(self: *Client, io: std.Io, allocator: std.mem.Allocator) !PagedItems
+pub fn listAllResources(self: *Client, io: std.Io, allocator: std.mem.Allocator) !PagedItems
+pub fn listAllResourceTemplates(self: *Client, io: std.Io, allocator: std.mem.Allocator) !PagedItems
+pub fn listAllPrompts(self: *Client, io: std.Io, allocator: std.mem.Allocator) !PagedItems
+pub fn getPrompt(self: *Client, io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !Response
+
+pub fn complete(self: *Client, io: std.Io, allocator: std.mem.Allocator, ref: std.json.Value, argument: std.json.Value) !Response
+pub fn setLogLevel(self: *Client, io: std.Io, allocator: std.mem.Allocator, level: []const u8) !Response
+pub fn ping(self: *Client, io: std.Io, allocator: std.mem.Allocator) !Response
+
+pub fn getTask(self: *Client, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !Response
+pub fn getTaskResult(self: *Client, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !Response
+pub fn listTasks(self: *Client, io: std.Io, allocator: std.mem.Allocator) !Response
+pub fn cancelTask(self: *Client, io: std.Io, allocator: std.mem.Allocator, taskId: []const u8) !Response
+
+pub fn request(self: *Client, io: std.Io, allocator: std.mem.Allocator, method: []const u8, params: ?std.json.Value) !Response
 
 pub fn notifyInitialized(self: *Client, io: std.Io, allocator: std.mem.Allocator) !void
 pub fn notifyRootsChanged(self: *Client, io: std.Io, allocator: std.mem.Allocator) !void
@@ -128,7 +185,7 @@ fn run(io: std.Io, allocator: std.mem.Allocator) !void {
         .name = "full-client",
         .version = "1.0.0",
     });
-    defer client.deinit(allocator);
+    defer client.deinit(io, allocator);
 
     client.enableRoots(true);
     client.enableSamplingAdvanced(true, true);

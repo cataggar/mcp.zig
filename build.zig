@@ -66,6 +66,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http-server", .src = "examples/http_server.zig", .run_step = "run-http", .desc = "Run the HTTP server example" },
     };
 
+    var example_server_exe: ?*std.Build.Step.Compile = null;
+
     inline for (examples) |ex| {
         const mod = b.createModule(.{
             .root_source_file = b.path(ex.src),
@@ -81,10 +83,32 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
 
         const run_artifact = b.addRunArtifact(exe);
-        if (b.args) |args| run_artifact.addArgs(args);
+        run_artifact.addPassthruArgs();
 
         const run_step = b.step(ex.run_step, ex.desc);
         run_step.dependOn(&run_artifact.step);
         all_step.dependOn(&exe.step);
+
+        if (comptime std.mem.eql(u8, ex.name, "example-server")) example_server_exe = exe;
     }
+
+    // The client tests spawn a real server over stdio, so they need to know
+    // where its binary landed.
+    const probe_mod = b.createModule(.{
+        .root_source_file = b.path("test/env_probe_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    probe_mod.addImport("mcp", mcp_module);
+    const env_probe_exe = b.addExecutable(.{
+        .name = "env-probe-server",
+        .root_module = probe_mod,
+    });
+
+    const test_options = b.addOptions();
+    test_options.addOptionPath("example_server_path", example_server_exe.?.getEmittedBin());
+    test_options.addOptionPath("env_probe_server_path", env_probe_exe.getEmittedBin());
+    test_mod.addOptions("build_options", test_options);
+    unit_tests.step.dependOn(&example_server_exe.?.step);
+    unit_tests.step.dependOn(&env_probe_exe.step);
 }

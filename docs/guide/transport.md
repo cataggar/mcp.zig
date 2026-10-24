@@ -25,6 +25,32 @@ try server.run(io, allocator, .stdio);
 try client.connectStdio(io, allocator, "./my-server", &.{});
 ```
 
+The child inherits this process's environment and working directory. Use
+`connectStdioOptions` to control either:
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    // ...
+    try client.connectStdioOptions(io, allocator, "./my-server", .{
+        .args = &.{"--verbose"},
+        // Layered on top of `base_environ`.
+        .env = &.{.{ .name = "API_KEY", .value = secret }},
+        // std hands the environment to `main`; it is not a global, so pass it
+        // in if you want the child to build on it.
+        .base_environ = init.environ_map,
+        .cwd = .{ .path = "/srv/project" },
+    });
+}
+```
+
+Set `inherit_environ = false` (and leave `base_environ` null) to give the
+child *only* the variables in `env`. That is the right default for a server
+you did not write: otherwise it receives every secret the host happens to
+hold, including credentials intended for a different server.
+
+Note that `argv[0]` is resolved by the child *after* it changes directory, so
+pass an absolute path for the command whenever you set `cwd`.
+
 ### How It Works
 
 1. Client spawns the server as a child process
@@ -45,15 +71,158 @@ For remote MCP servers or web-based integration.
 
 ### Server Side
 
+Loopback binds need no ceremony:
+
 ```zig
 try server.run(io, allocator, .{ .http = .{ .port = 8080 } });
 ```
 
-Custom host/domain and port:
+Exposing the server beyond this machine is opt-in and requires a token:
 
 ```zig
-try server.run(io, allocator, .{ .http = .{ .host = "api.example.com", .port = 8443 } });
+try server.run(io, allocator, .{ .http = .{
+    .host = "0.0.0.0",
+    .port = 8443,
+    .allow_non_loopback = true,
+    .auth_token = my_secret, // at least 32 characters
+} });
 ```
+
+| Field | Default | Meaning |
+| ----- | ------- | ------- |
+| `host` | `"localhost"` | Address to bind. Loopback forms (`localhost`, `127.0.0.0/8`, `::1`) need no opt-in. |
+| `allow_non_loopback` | `false` | Required to bind any other address. |
+| `auth_token` | `null` | Bearer token required on every request. Mandatory for non-loopback binds; minimum 32 characters. |
+| `allowed_origins` | `&.{}` | Origins allowed to make browser-initiated requests. Empty rejects any request carrying `Origin`. |
+| `connection_timeout_s` | `30` | Read/write deadline per connection. `0` disables. |
+| `shutdown_grace_ms` | `5000` | How long `shutdown` waits for in-flight connections to drain. |
+| `reuse_address` | `true` | Sets `SO_REUSEADDR`, so a restart is not blocked by `TIME_WAIT`. |
+
+Session limits are fields on `Server` rather than on the run config:
+
+| Field | Default | Purpose |
+| ----- | ------- | ------- |
+| `max_sessions` | `256` | Concurrently tracked HTTP sessions. Further handshakes get `503`. |
+| `session_idle_timeout_s` | `300` | Idle seconds before a session is reclaimed. |
+| `max_tasks_per_session` | `256` | Tasks retained per session. |
+| `max_connections` | `64` | HTTP connections served on their own thread at once. |
+
+### Concurrency
+
+Each accepted HTTP connection is served on its own thread, so one slow client
+cannot stall the others behind it. Once `max_connections` connections are in
+flight the accept loop serves the next one inline rather than spawning without
+bound or refusing it, which caps thread growth while still making progress.
+
+Requests against the *same* session are serialized: the session is locked for
+the duration of a request, so two requests sharing an `Mcp-Session-Id` cannot
+interleave their mutations of that session's tasks, log level or handshake.
+
+A session that is being served is reference-counted, so a concurrent idle sweep
+or `DELETE` unpublishes it immediately — no new request can find it — but frees
+it only once the last in-flight request finishes.
+
+Every accepted connection gets a `connection_timeout_s` read and write deadline,
+so a client cannot hold a connection slot by dribbling out a request head. This
+is best effort: a platform that rejects the socket option leaves the connection
+without a deadline rather than refusing it. Windows deadlines go through Winsock
+directly, since `std.posix.setsockopt` is a compile error there.
+
+### Shutdown
+
+`Server.shutdown(io)` is safe to call from any thread:
+
+```zig
+server.shutdown(io); // e.g. from a signal handler thread
+```
+
+It marks the server as shutting down, shuts the listening socket down, and dials
+the listener once. Either mechanism unblocks a parked `accept`; the socket
+shutdown does not do so on every platform, so the wake-up connection is what
+makes shutdown portable. It requires a fixed port — a server bound to port `0`
+stops only once a client happens to connect. Without any of this, a server with
+no traffic could not be stopped at all, because the accept loop only re-checks
+state between connections. `runHttp` then waits up to `shutdown_grace_ms` for in-flight
+connections to finish before returning.
+
+Repeated accept failures back off from 1 ms to a cap of 1 s rather than spinning.
+
+When `auth_token` is set, every request must carry
+`Authorization: Bearer <token>`; anything else is answered with `401` before
+the body is read. The configuration is validated before the listener is
+created, so a server that would expose tools without authentication refuses to
+start.
+
+### Status codes
+
+| Situation | Status |
+| --------- | ------ |
+| Method other than `POST`/`GET`/`DELETE` | `405` |
+| `GET` without `Accept: text/event-stream` | `406` |
+| `GET` without `Mcp-Session-Id` | `400` |
+| Disallowed `Origin` | `403` |
+| `Content-Type` other than `application/json` | `415` |
+| Missing or wrong `Authorization` | `401` with `WWW-Authenticate` |
+| Unsupported `MCP-Protocol-Version` | `400` |
+| Body over `max_http_body_size` | `413` |
+| Unknown session id | `404` |
+| Session id that existed and was terminated | `410` |
+| Too many active sessions | `503` |
+| Notification accepted, no response body | `202` |
+| `DELETE` of an idle session | `204` |
+| `DELETE` of a session with work still unwinding | `202` |
+
+A request body may be sent with `Content-Length` or with
+`Transfer-Encoding: chunked`; the size cap is enforced on the bytes actually
+read either way, not on the declared length alone.
+
+`MCP-Protocol-Version` is validated against the supported set and echoed on
+responses. A request without the header is read as `2025-03-26`, per the spec's
+backwards-compatibility rule.
+
+A session that is terminated while it still has work in flight is unpublished
+immediately and its `cancel_requested` flag is set. Long-running tool handlers
+should poll `session.isCancelled()` and abandon work whose result can no longer
+be delivered.
+
+### Event streams
+
+`GET` with `Accept: text/event-stream` and an `Mcp-Session-Id` opens the
+server-to-client stream. Server-initiated notifications — `tools/list_changed`,
+progress, log messages — are delivered there. Without it they could only ride
+along with a response the client happened to ask for.
+
+Every event carries an `id`. A client that reconnects with `Last-Event-ID: N`
+receives everything newer than `N` from the session's replay buffer, which holds
+the most recent `Session.max_replay_events` (256) events. Ids keep advancing
+past dropped events, so a client can tell it missed some and re-initialize.
+
+A `POST` that asks for `text/event-stream` now returns every message the handler
+produced, each as its own event, so progress notifications emitted before the
+result are no longer discarded. An idle stream emits a `: keepalive` comment
+every 15 seconds so proxies do not reap it.
+
+Message payloads are split on newlines across multiple `data:` lines, so an
+embedded newline cannot terminate a frame early and forge the events after it.
+
+### Browser-originated requests
+
+Two checks run before authentication:
+
+- Any request carrying an `Origin` header is rejected with `403` unless that
+  origin is listed in `allowed_origins`. Ordinary MCP clients are not browsers
+  and send no `Origin`, so the empty default is transparent for them.
+- The body must be declared `application/json`, or the request is rejected with
+  `415`. Parameters such as `; charset=utf-8` are fine.
+
+The `Content-Type` requirement is what blocks cross-site requests, not merely a
+formality. `text/plain`, `application/x-www-form-urlencoded` and
+`multipart/form-data` are the CORS-*simple* content types, which browsers send
+with **no preflight**. Requiring `application/json` forces a preflight that
+this server never answers.
+
+Binding loopback is no protection against either of these, because the request
+originates from the victim's own browser.
 
 ### Client Side
 
@@ -61,23 +230,79 @@ try server.run(io, allocator, .{ .http = .{ .host = "api.example.com", .port = 8
 try client.connectHttp(io, allocator, "http://localhost:8080");
 ```
 
+`connectHttpOptions` adds headers to every request, for auth schemes and
+routing headers the transport does not model itself:
+
+```zig
+try client.connectHttpOptions(io, allocator, "https://example.test/mcp", .{
+    .extra_headers = &.{
+        .{ .name = "X-Api-Key", .value = api_key },
+        .{ .name = "X-Tenant", .value = "acme" },
+    },
+});
+```
+
+Header names and values are validated because they typically come from a
+config file, which is an untrusted-input boundary:
+
+- names must be RFC 9110 tokens, values may not contain CR, LF or NUL, so a
+  value cannot inject a second header;
+- `Content-Type`, `Accept`, `MCP-Protocol-Version` and `MCP-Session-Id` are
+  reserved (`error.ReservedHeader`) — overriding them breaks the protocol
+  rather than customising it;
+- `Authorization` may come from `extra_headers` *or*
+  `setAuthorizationToken`, not both (`error.DuplicateAuthorization`).
+
+Validation is all-or-nothing: a rejected batch leaves the previous headers in
+place. Like the bearer token, these headers are never sent across a redirect —
+the transport refuses to follow one at all.
+
 ### Endpoints
 
-| Endpoint | Method | Description       |
-| -------- | ------ | ----------------- |
-| `/`      | POST   | JSON-RPC endpoint |
+| Endpoint | Method | Description             |
+| -------- | ------ | ----------------------- |
+| `/`      | POST   | JSON-RPC endpoint       |
+| `/`      | DELETE | Terminate a session     |
+
+### Sessions
+
+Each client gets its own state. The handshake, the negotiated client info, the
+log level set via `logging/setLevel` and any tasks belong to one session and are
+invisible to every other client.
+
+`initialize` is answered with an `Mcp-Session-Id` header. Every later request
+must repeat that header, or the server answers `-32002 Server not initialized`;
+an unrecognised or expired id is answered with `404`. The id is 32 bytes from
+the secure random source, rendered as hex, and the session table is keyed by its
+SHA-256 digest so a lookup never compares the value a client presented.
+
+Treat the id as a credential: anything holding it can act as that client.
+
+`stdio` and custom transports carry exactly one client, so they use a single
+implicit session and need no header.
 
 ### HTTP Request Format
 
 Send JSON-RPC payloads as `application/json` with HTTP `POST`:
 
 ```bash
-curl -X POST http://localhost:8080 \
+# Handshake. The response carries the session id.
+curl -sD - -X POST http://localhost:8080 \
     -H "Content-Type: application/json" \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+
+# Every later request repeats it.
+curl -X POST http://localhost:8080 \
+    -H "Content-Type: application/json" \
+    -H "Mcp-Session-Id: <id from the handshake>" \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# Release the session early. Otherwise it expires on the idle timeout.
+curl -X DELETE http://localhost:8080 -H "Mcp-Session-Id: <id>"
 ```
 
-The response body contains the JSON-RPC response.
+The response body contains the JSON-RPC response. `connectHttp` records and
+replays the session id for you.
 
 ### Example Pattern
 
@@ -131,9 +356,39 @@ const MyTransport = struct {
 
 ### STDIO Options
 
+`StdioTransport` is a plain struct with defaults, so it is constructed with
+`.{}` and configured by setting fields:
+
 ```zig
-const stdio_transport = mcp.transport.StdioTransport.init(allocator);
+var stdio_transport: mcp.transport.StdioTransport = .{};
+defer stdio_transport.deinit(allocator);
 ```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `in` | `null` (this process's stdin) | Stream to read messages from |
+| `out` | `null` (this process's stdout) | Stream to write messages to |
+| `max_message_size` | 4 MiB | Largest single message accepted; a longer one fails with `MessageTooLarge` |
+
+The defaults are what a **server** wants: it is spawned with its standard
+streams already wired to its parent. A **client** that spawns a server must
+instead point `in` at the child's stdout and `out` at the child's stdin:
+
+```zig
+var child = try std.process.spawn(io, .{
+    .argv = argv,
+    .stdin = .pipe,
+    .stdout = .pipe,
+});
+var stdio_transport: mcp.transport.StdioTransport = .{
+    .in = child.stdout.?,
+    .out = child.stdin.?,
+};
+```
+
+Messages are newline-delimited, and reads are buffered, so `receive` may pull
+more than one message off the stream in a single syscall. The extra bytes are
+retained and returned by the following `receive` calls.
 
 ### HTTP Options
 

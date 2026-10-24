@@ -116,6 +116,10 @@ pub const ErrorCode = struct {
     pub const SERVER_NOT_INITIALIZED: i32 = -32002;
     pub const REQUEST_CANCELLED: i32 = -32800;
     pub const CONTENT_TOO_LARGE: i32 = -32801;
+    /// Implementation-defined (the -32000..-32099 range JSON-RPC reserves for
+    /// servers): every worker is busy, so the call was refused rather than
+    /// queued behind work the client cannot see.
+    pub const SERVER_BUSY: i32 = -32000;
 };
 
 /// Errors that can occur during message parsing.
@@ -224,7 +228,12 @@ fn parseErrorResponse(obj: std.json.ObjectMap) !ErrorResponse {
 
     const err = error_obj.object;
     const code = if (err.get("code")) |c| switch (c) {
-        .integer => @as(i32, @intCast(c.integer)),
+        // std.json parses integers as i64, so a peer can supply a value that
+        // does not fit in i32. An unchecked @intCast would panic in safe
+        // builds and silently truncate in ReleaseFast; treat it as a
+        // malformed message instead, which the caller already turns into a
+        // proper JSON-RPC parse error.
+        .integer => std.math.cast(i32, c.integer) orelse return error.InvalidMessage,
         else => return error.InvalidMessage,
     } else return error.InvalidMessage;
 
@@ -271,9 +280,8 @@ pub fn serializeMessage(allocator: std.mem.Allocator, message: Message) ![]u8 {
 fn serializeRequest(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), req: Request) !void {
     try buffer.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
     try serializeRequestId(allocator, buffer, req.id);
-    try buffer.appendSlice(allocator, ",\"method\":\"");
-    try buffer.appendSlice(allocator, req.method);
-    try buffer.appendSlice(allocator, "\"");
+    try buffer.appendSlice(allocator, ",\"method\":");
+    try appendJsonString(allocator, buffer, req.method);
     if (req.params) |params| {
         try buffer.appendSlice(allocator, ",\"params\":");
         try serializeValue(allocator, buffer, params);
@@ -282,9 +290,8 @@ fn serializeRequest(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), re
 }
 
 fn serializeNotification(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), notif: Notification) !void {
-    try buffer.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"");
-    try buffer.appendSlice(allocator, notif.method);
-    try buffer.appendSlice(allocator, "\"");
+    try buffer.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"method\":");
+    try appendJsonString(allocator, buffer, notif.method);
     if (notif.params) |params| {
         try buffer.appendSlice(allocator, ",\"params\":");
         try serializeValue(allocator, buffer, params);
@@ -315,9 +322,8 @@ fn serializeErrorResponse(allocator: std.mem.Allocator, buffer: *std.ArrayList(u
     var code_buf: [16]u8 = undefined;
     const code_str = std.fmt.bufPrint(&code_buf, "{d}", .{err.@"error".code}) catch "0";
     try buffer.appendSlice(allocator, code_str);
-    try buffer.appendSlice(allocator, ",\"message\":\"");
-    try buffer.appendSlice(allocator, err.@"error".message);
-    try buffer.appendSlice(allocator, "\"");
+    try buffer.appendSlice(allocator, ",\"message\":");
+    try appendJsonString(allocator, buffer, err.@"error".message);
     if (err.@"error".data) |data| {
         try buffer.appendSlice(allocator, ",\"data\":");
         try serializeValue(allocator, buffer, data);
@@ -325,12 +331,50 @@ fn serializeErrorResponse(allocator: std.mem.Allocator, buffer: *std.ArrayList(u
     try buffer.appendSlice(allocator, "}}");
 }
 
+/// Appends `s` to `buffer` as a complete JSON string literal, including the
+/// surrounding quotes.
+///
+/// Every string this module emits must go through here. Emitting a raw slice
+/// between two quote characters lets a peer that controls the slice close the
+/// string early and inject arbitrary JSON structure. Because request IDs are
+/// chosen by the peer and echoed back in every response, and because both
+/// framings in use are delimiter-based (newline for stdio, a blank line for
+/// SSE), an unescaped newline does not merely corrupt one object: it ends the
+/// current frame and starts one the peer fully controls.
+fn appendJsonString(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), s: []const u8) !void {
+    try buffer.append(allocator, '"');
+    try appendJsonStringChars(allocator, buffer, s);
+    try buffer.append(allocator, '"');
+}
+
+/// Appends the escaped body of a JSON string literal, without the quotes,
+/// per RFC 8259 section 7.
+fn appendJsonStringChars(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try buffer.appendSlice(allocator, "\\\""),
+            '\\' => try buffer.appendSlice(allocator, "\\\\"),
+            0x08 => try buffer.appendSlice(allocator, "\\b"),
+            0x09 => try buffer.appendSlice(allocator, "\\t"),
+            0x0A => try buffer.appendSlice(allocator, "\\n"),
+            0x0C => try buffer.appendSlice(allocator, "\\f"),
+            0x0D => try buffer.appendSlice(allocator, "\\r"),
+            // The remaining C0 controls have no short escape but are still
+            // forbidden raw inside a string.
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                var escape_buf: [6]u8 = undefined;
+                const escaped = std.fmt.bufPrint(&escape_buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                try buffer.appendSlice(allocator, escaped);
+            },
+            else => try buffer.append(allocator, c),
+        }
+    }
+}
+
 fn serializeRequestId(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), id: types.RequestId) !void {
     switch (id) {
         .string => |s| {
-            try buffer.appendSlice(allocator, "\"");
-            try buffer.appendSlice(allocator, s);
-            try buffer.appendSlice(allocator, "\"");
+            try appendJsonString(allocator, buffer, s);
         },
         .integer => |i| {
             var int_buf: [32]u8 = undefined;
@@ -355,18 +399,7 @@ pub fn serializeValue(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), 
             try buffer.appendSlice(allocator, float_str);
         },
         .string => |s| {
-            try buffer.appendSlice(allocator, "\"");
-            for (s) |c| {
-                switch (c) {
-                    '"' => try buffer.appendSlice(allocator, "\\\""),
-                    '\\' => try buffer.appendSlice(allocator, "\\\\"),
-                    '\n' => try buffer.appendSlice(allocator, "\\n"),
-                    '\r' => try buffer.appendSlice(allocator, "\\r"),
-                    '\t' => try buffer.appendSlice(allocator, "\\t"),
-                    else => try buffer.append(allocator, c),
-                }
-            }
-            try buffer.appendSlice(allocator, "\"");
+            try appendJsonString(allocator, buffer, s);
         },
         .array => |arr| {
             try buffer.appendSlice(allocator, "[");
@@ -383,9 +416,8 @@ pub fn serializeValue(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), 
             while (iter.next()) |entry| {
                 if (!first) try buffer.appendSlice(allocator, ",");
                 first = false;
-                try buffer.appendSlice(allocator, "\"");
-                try buffer.appendSlice(allocator, entry.key_ptr.*);
-                try buffer.appendSlice(allocator, "\":");
+                try appendJsonString(allocator, buffer, entry.key_ptr.*);
+                try buffer.appendSlice(allocator, ":");
                 try serializeValue(allocator, buffer, entry.value_ptr.*);
             }
             try buffer.appendSlice(allocator, "}");
@@ -492,4 +524,150 @@ test "serialize request" {
 test "error codes" {
     try std.testing.expectEqual(@as(i32, -32700), ErrorCode.PARSE_ERROR);
     try std.testing.expectEqual(@as(i32, -32600), ErrorCode.INVALID_REQUEST);
+}
+
+/// Round-trips `json` through the parser and returns the value, asserting that
+/// what the serializer produced is well-formed JSON in the first place.
+fn expectReparses(json: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+}
+
+test "serializer escapes string request IDs" {
+    // A peer that controls `id` must not be able to close the string early and
+    // inject members into the response object.
+    const hostile = "a\",\"injected\":\"yes";
+    const resp = createResponse(.{ .string = hostile }, .{ .object = .empty });
+    const json = try serializeMessage(std.testing.allocator, .{ .response = resp });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try expectReparses(json);
+    defer parsed.deinit();
+
+    // The id must survive intact, and no extra member may appear.
+    try std.testing.expectEqualStrings(hostile, parsed.value.object.get("id").?.string);
+    try std.testing.expect(parsed.value.object.get("injected") == null);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.object.count());
+}
+
+test "serializer escapes newlines in request IDs so frames cannot be smuggled" {
+    // stdio framing is newline-delimited and SSE framing is blank-line
+    // delimited, so a raw newline in `id` would terminate the frame and let the
+    // peer start one of its own.
+    const hostile = "x\n\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}";
+    const resp = createResponse(.{ .string = hostile }, .{ .object = .empty });
+    const json = try serializeMessage(std.testing.allocator, .{ .response = resp });
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOfScalar(u8, json, '\n') == null);
+
+    var parsed = try expectReparses(json);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(hostile, parsed.value.object.get("id").?.string);
+}
+
+test "serializer escapes error messages" {
+    const hostile = "boom\",\"injected\":\"yes";
+    const err = createErrorResponse(.{ .integer = 1 }, ErrorCode.INTERNAL_ERROR, hostile, null);
+    const json = try serializeMessage(std.testing.allocator, .{ .error_response = err });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try expectReparses(json);
+    defer parsed.deinit();
+
+    const error_obj = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(hostile, error_obj.get("message").?.string);
+    try std.testing.expect(parsed.value.object.get("injected") == null);
+    try std.testing.expect(error_obj.get("injected") == null);
+}
+
+test "serializer escapes object keys" {
+    var result: std.json.ObjectMap = .empty;
+    defer result.deinit(std.testing.allocator);
+    const hostile_key = "k\",\"injected\":\"yes";
+    try result.put(std.testing.allocator, hostile_key, .{ .string = "v" });
+
+    const resp = createResponse(.{ .integer = 1 }, .{ .object = result });
+    const json = try serializeMessage(std.testing.allocator, .{ .response = resp });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try expectReparses(json);
+    defer parsed.deinit();
+
+    const result_obj = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(usize, 1), result_obj.count());
+    try std.testing.expectEqualStrings("v", result_obj.get(hostile_key).?.string);
+}
+
+test "serializer escapes method names" {
+    const hostile = "m\",\"injected\":\"yes";
+    const notif = createNotification(hostile, null);
+    const json = try serializeMessage(std.testing.allocator, .{ .notification = notif });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try expectReparses(json);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(hostile, parsed.value.object.get("method").?.string);
+    try std.testing.expect(parsed.value.object.get("injected") == null);
+}
+
+test "serializer escapes all C0 control characters" {
+    // RFC 8259 section 7 forbids raw control characters inside a string. The
+    // previous implementation only handled \n, \r and \t.
+    var raw: [0x20]u8 = undefined;
+    for (&raw, 0..) |*c, i| c.* = @intCast(i);
+
+    const resp = createResponse(.{ .string = &raw }, .{ .object = .empty });
+    const json = try serializeMessage(std.testing.allocator, .{ .response = resp });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try expectReparses(json);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(&raw, parsed.value.object.get("id").?.string);
+}
+
+test "serializer escapes backslashes" {
+    // A trailing backslash would otherwise escape the closing quote.
+    const hostile = "c:\\path\\";
+    const resp = createResponse(.{ .string = hostile }, .{ .object = .empty });
+    const json = try serializeMessage(std.testing.allocator, .{ .response = resp });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try expectReparses(json);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(hostile, parsed.value.object.get("id").?.string);
+}
+
+test "out-of-range error codes are rejected rather than crashing" {
+    // std.json parses integers as i64, so a peer can send a code outside the
+    // i32 range. This used to reach an unchecked @intCast and abort the
+    // process from any connection, before initialize.
+    const cases = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":9999999999,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-9999999999,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":9223372036854775807,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-9223372036854775808,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":2147483648,\"message\":\"x\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-2147483649,\"message\":\"x\"}}",
+    };
+
+    for (cases) |json| {
+        try std.testing.expectError(
+            ParseError.InvalidMessage,
+            parseMessage(std.testing.allocator, json),
+        );
+    }
+}
+
+test "in-range error codes still parse, including i32 boundaries" {
+    const cases = [_]struct { json: []const u8, code: i32 }{
+        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"x\"}}", .code = -32600 },
+        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":2147483647,\"message\":\"x\"}}", .code = 2147483647 },
+        .{ .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-2147483648,\"message\":\"x\"}}", .code = -2147483648 },
+    };
+
+    for (cases) |case| {
+        var parsed = try parseMessage(std.testing.allocator, case.json);
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.code, parsed.message.error_response.@"error".code);
+    }
 }

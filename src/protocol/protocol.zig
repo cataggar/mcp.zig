@@ -25,6 +25,11 @@ pub const SUPPORTED_VERSIONS = [_][]const u8{
     "2024-11-05",
 };
 
+/// The version to assume when a client sends no `MCP-Protocol-Version`
+/// header, per the spec: the header was introduced after this revision, so its
+/// absence identifies a client that predates it.
+pub const ASSUMED_VERSION_WITHOUT_HEADER = "2025-03-26";
+
 /// JSON-RPC version used by MCP.
 pub const JSONRPC_VERSION = "2.0";
 
@@ -90,9 +95,10 @@ pub const Method = enum {
 
     /// Parses a method name string into the corresponding enum value.
     pub fn fromString(str: []const u8) ?Method {
-        inline for (std.meta.fields(Method)) |field| {
-            if (std.mem.eql(u8, field.name, str)) {
-                return @enumFromInt(field.value);
+        const type_info = @typeInfo(Method).@"enum";
+        inline for (type_info.field_names, type_info.field_values) |name, value| {
+            if (std.mem.eql(u8, name, str)) {
+                return @fromBackingInt(@intCast(value));
             }
         }
         return null;

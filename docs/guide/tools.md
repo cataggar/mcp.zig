@@ -67,6 +67,35 @@ try server.addTool(.{
 });
 ```
 
+### Supplying a schema you already have
+
+`inputSchema` covers `type`, `properties`, `required`, `description` and
+`$schema`. JSON Schema says a great deal more than that, so a schema you
+already have — authored as JSON, pasted from a specification, or kept in a
+file — can be handed over verbatim instead:
+
+```zig
+try server.addTool(.{
+    .name = "greet",
+    .description = "Greet a person",
+    .handler = greetHandler,
+    .input_schema_json =
+    \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}
+    ,
+});
+```
+
+Everything you write is republished exactly as written, so keywords the
+struct cannot express — `additionalProperties`, top-level `oneOf`, `$defs`,
+`title`, `default` — reach the client intact. `additionalProperties: false`
+in particular is how you tell a model that a misspelt argument name is an
+error rather than an ignored extra.
+
+`input_schema_json` takes precedence when both are set. The text is parsed
+once by `addTool`, which returns `error.InvalidInputSchema` if it is not a
+JSON object, so a malformed schema fails at registration rather than
+reaching a client.
+
 ## Argument Helpers
 
 ### Get String Argument
@@ -149,6 +178,33 @@ fn handler(_: ?*anyopaque, _: std.Io, allocator: Allocator, args: ?std.json.Valu
     return .{ .content = &.{} };
 }
 ```
+
+There are two kinds of failure and they are answered differently, because they
+mean different things to a client.
+
+`error.InvalidArguments` says the *call* was malformed, and is answered with a
+JSON-RPC protocol error naming the tool:
+
+```json
+{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params","data":"my_tool"}}
+```
+
+Every other error — `ExecutionFailed`, `PermissionDenied`, `ResourceNotFound`,
+`Timeout`, `Unknown` — says the call was well formed and the work failed, so it
+is answered as a result the model is expected to read and react to:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ExecutionFailed"}],"isError":true}}
+```
+
+Use `error.InvalidArguments` only for arguments you refuse to act on. Asking a
+model to retry a call it made correctly is wasted work, and hiding a genuine
+argument error inside readable content leaves the model rephrasing a request
+that was never going to be accepted.
+
+For a failure the model should see with an explanation, prefer returning
+`mcp.tools.errorResult(allocator, "…")` over an error value, so the text is
+yours rather than an error name.
 
 ## Tool Builder
 
@@ -276,3 +332,54 @@ fn calculateHandler(
 - [Resources Guide](/guide/resources) - Expose data to AI
 - [Prompts Guide](/guide/prompts) - Create prompt templates
 - [Error Handling](/guide/error-handling) - Handle errors properly
+
+## Long-running tools and cancellation
+
+A client that no longer wants a result sends `notifications/cancelled` naming
+the request id. A tool that may run for a while should notice and stop, rather
+than finishing work nobody is waiting for.
+
+Register a `contextual_handler` instead of a `handler` to receive the request
+being served:
+
+```zig
+fn indexRepo(
+    user_data: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arguments: ?std.json.Value,
+    request: *const mcp.RequestContext,
+) mcp.tools.ToolError!mcp.tools.ToolResult {
+    for (files) |file| {
+        if (request.isCancelled()) return mcp.tools.ToolError.ExecutionFailed;
+        try index(file);
+    }
+    return mcp.tools.textResult(allocator, "done");
+}
+
+try server.addTool(.{
+    .name = "index_repo",
+    .description = "Indexes the workspace",
+    .contextual_handler = indexRepo,
+    .user_data = &app,
+});
+```
+
+`handler` and `contextual_handler` are both optional and interchangeable;
+existing tools need no change. When both are set the contextual one is used.
+
+A few properties worth knowing:
+
+- **The flag is set from another thread.** `isCancelled` is an atomic load, so
+  polling it from inside a loop is safe and cheap.
+- **A cancelled call is answered `-32800 Request cancelled`**, whether the
+  handler returned an error or a partial result. A result the client stopped
+  waiting for is not worth shipping.
+- **Cancellations are not queued behind the request they cancel.** Requests on
+  one session are otherwise serialized, so a cancellation that waited its turn
+  would always arrive after the handler had finished. It is dispatched
+  immediately instead.
+- **Terminating a session cancels everything running on it**, so a client that
+  disconnects or `DELETE`s its session does not leave handlers grinding away.
+- **A cancellation for a request that is not in flight is ignored.** It raced
+  the response, which the specification says to treat as normal.

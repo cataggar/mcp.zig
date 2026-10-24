@@ -19,6 +19,9 @@ pub const Transport = struct {
         send: *const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, message: []const u8) SendError!void,
         receive: *const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator) ReceiveError!?[]const u8,
         close: *const fn (ptr: *anyopaque) void,
+        /// Release the implementation and the allocation holding it. Only
+        /// valid for transports the caller handed ownership of.
+        deinit: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
     };
 
     pub const SendError = error{
@@ -49,16 +52,37 @@ pub const Transport = struct {
     pub fn close(self: Transport) void {
         self.vtable.close(self.ptr);
     }
+
+    /// Releases the transport implementation and its allocation.
+    pub fn deinit(self: Transport, allocator: std.mem.Allocator) void {
+        self.vtable.deinit(self.ptr, allocator);
+    }
 };
 
 /// STDIO transport for local process communication.
 /// Messages are delimited by newlines and sent via stdin/stdout.
 pub const StdioTransport = struct {
+    /// Bytes pulled off the stream but not yet returned as a message. A
+    /// buffered read can cross a newline, so the tail is kept here for the
+    /// next `receive` rather than being re-read (it cannot be un-read).
     read_buffer: std.ArrayList(u8) = .empty,
     is_closed: bool = false,
+    /// Set once the stream reports EOF, so a trailing message with no final
+    /// newline is still delivered before `EndOfStream` is reported.
+    at_end: bool = false,
     max_message_size: usize = 4 * 1024 * 1024,
+    /// Stream to read messages from. `null` means this process's stdin, which
+    /// is what a server wants. A client that spawns a server points this at
+    /// the child's stdout instead.
+    in: ?std.Io.File = null,
+    /// Stream to write messages to. `null` means this process's stdout.
+    out: ?std.Io.File = null,
 
     const Self = @This();
+
+    /// Size of a single read syscall. Reading a byte at a time cost one
+    /// syscall per byte, which dominated the cost of receiving a message.
+    const read_chunk_size = 64 * 1024;
 
     /// Releases resources held by the transport.
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -69,9 +93,9 @@ pub const StdioTransport = struct {
     pub fn send(self: *Self, io: std.Io, _: std.mem.Allocator, message: []const u8) Transport.SendError!void {
         if (self.is_closed) return Transport.SendError.ConnectionClosed;
 
-        const stdout = std.Io.File.stdout();
-        stdout.writeStreamingAll(io, message) catch return Transport.SendError.WriteError;
-        stdout.writeStreamingAll(io, "\n") catch return Transport.SendError.WriteError;
+        const out = self.out orelse std.Io.File.stdout();
+        out.writeStreamingAll(io, message) catch return Transport.SendError.WriteError;
+        out.writeStreamingAll(io, "\n") catch return Transport.SendError.WriteError;
     }
 
     /// Sends a JSON-RPC message object.
@@ -81,45 +105,74 @@ pub const StdioTransport = struct {
         try self.send(io, allocator, json);
     }
 
-    /// Receives a JSON-RPC message from stdin (reads until newline).
+    /// Removes and returns the next newline-delimited message already sitting
+    /// in `read_buffer`, or null if it does not yet hold a whole one.
+    fn takeBufferedMessage(self: *Self, allocator: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+        const idx = std.mem.indexOfScalar(u8, self.read_buffer.items, '\n') orelse return null;
+        const message = try allocator.dupe(u8, self.read_buffer.items[0..idx]);
+        const rest_start = idx + 1;
+        const rest_len = self.read_buffer.items.len - rest_start;
+        std.mem.copyForwards(u8, self.read_buffer.items[0..rest_len], self.read_buffer.items[rest_start..]);
+        self.read_buffer.shrinkRetainingCapacity(rest_len);
+        return message;
+    }
+
+    /// Receives a newline-delimited JSON-RPC message from the input stream.
     pub fn receive(self: *Self, io: std.Io, allocator: std.mem.Allocator) Transport.ReceiveError!?[]const u8 {
         if (self.is_closed) return Transport.ReceiveError.ConnectionClosed;
 
-        self.read_buffer.clearRetainingCapacity();
+        if (try self.takeBufferedMessage(allocator)) |message| {
+            if (message.len == 0) {
+                allocator.free(message);
+                return null;
+            }
+            return message;
+        }
 
-        const stdin = std.Io.File.stdin();
+        const in = self.in orelse std.Io.File.stdin();
 
         while (true) {
-            var buf: [1]u8 = undefined;
-            const bytes_read = stdin.readStreaming(io, &.{&buf}) catch return Transport.ReceiveError.ReadError;
-
-            if (bytes_read == 0) {
-                if (self.read_buffer.items.len == 0) {
-                    return Transport.ReceiveError.EndOfStream;
-                }
-                break;
+            if (self.at_end) {
+                // A final message with no trailing newline is still a message.
+                if (self.read_buffer.items.len == 0) return Transport.ReceiveError.EndOfStream;
+                const message = allocator.dupe(u8, self.read_buffer.items) catch {
+                    return Transport.ReceiveError.OutOfMemory;
+                };
+                self.read_buffer.clearRetainingCapacity();
+                return message;
             }
 
-            const byte = buf[0];
-            if (byte == '\n') {
-                break;
-            }
+            var chunk: [read_chunk_size]u8 = undefined;
+            // End of stream is reported as an error, not as a zero-length
+            // read; the previous implementation mapped it to `ReadError` and
+            // so never reported `EndOfStream` at all. A zero-length read is
+            // also legal and does not mean the stream ended.
+            const bytes_read = in.readStreaming(io, &.{&chunk}) catch |err| switch (err) {
+                error.EndOfStream => {
+                    self.at_end = true;
+                    continue;
+                },
+                else => return Transport.ReceiveError.ReadError,
+            };
+            if (bytes_read == 0) continue;
 
-            if (self.read_buffer.items.len >= self.max_message_size) {
+            // No newline is in the buffer at this point, so everything held is
+            // one unterminated message and the cap applies to all of it.
+            if (self.read_buffer.items.len + bytes_read > self.max_message_size) {
                 return Transport.ReceiveError.MessageTooLarge;
             }
+            self.read_buffer.appendSlice(allocator, chunk[0..bytes_read]) catch {
+                return Transport.ReceiveError.OutOfMemory;
+            };
 
-            self.read_buffer.append(allocator, byte) catch return Transport.ReceiveError.OutOfMemory;
+            if (try self.takeBufferedMessage(allocator)) |message| {
+                if (message.len == 0) {
+                    allocator.free(message);
+                    return null;
+                }
+                return message;
+            }
         }
-
-        if (self.read_buffer.items.len == 0) {
-            return null;
-        }
-
-        const result = allocator.dupe(u8, self.read_buffer.items) catch {
-            return Transport.ReceiveError.OutOfMemory;
-        };
-        return result;
     }
 
     /// Closes the transport.
@@ -142,6 +195,7 @@ pub const StdioTransport = struct {
                 .send = sendVtable,
                 .receive = receiveVtable,
                 .close = closeVtable,
+                .deinit = deinitVtable,
             },
         };
     }
@@ -160,6 +214,12 @@ pub const StdioTransport = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.close();
     }
+
+    fn deinitVtable(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.deinit(allocator);
+        allocator.destroy(self);
+    }
 };
 
 /// HTTP transport for remote server communication.
@@ -171,8 +231,28 @@ pub const HttpTransport = struct {
     protocol_version: []const u8 = "2025-11-25",
     is_closed: bool = false,
     pending_responses: std.ArrayList([]const u8) = .empty,
+    /// Caller-supplied headers sent with every request. Owned by the
+    /// transport; see `setExtraHeaders`.
+    extra_headers: []const std.http.Header = &.{},
 
     const Self = @This();
+
+    /// Headers this transport builds itself. A caller supplying one of these
+    /// is a configuration error rather than an override, because changing them
+    /// breaks the protocol rather than customising it.
+    pub const reserved_header_names = [_][]const u8{
+        "content-type",
+        "accept",
+        "mcp-protocol-version",
+        "mcp-session-id",
+    };
+
+    pub const HeaderError = error{
+        InvalidHeaderName,
+        InvalidHeaderValue,
+        ReservedHeader,
+        DuplicateAuthorization,
+    };
 
     /// Initializes a new HTTP transport with the given endpoint URL.
     pub fn init(allocator: std.mem.Allocator, endpoint: []const u8) !Self {
@@ -195,13 +275,90 @@ pub const HttpTransport = struct {
         if (self.authorization_token) |token| {
             allocator.free(token);
         }
+        self.freeExtraHeaders(allocator);
+    }
+
+    fn freeExtraHeaders(self: *Self, allocator: std.mem.Allocator) void {
+        for (self.extra_headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(self.extra_headers);
+        self.extra_headers = &.{};
+    }
+
+    fn isTokenChar(c: u8) bool {
+        return switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9' => true,
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+            else => false,
+        };
+    }
+
+    /// Rejects anything that could inject a second header, or a body, into the
+    /// request head. Config files are a normal source of these values, so this
+    /// is an untrusted-input boundary.
+    pub fn validateHeader(header: std.http.Header) HeaderError!void {
+        if (header.name.len == 0) return error.InvalidHeaderName;
+        for (header.name) |c| {
+            if (!isTokenChar(c)) return error.InvalidHeaderName;
+        }
+        for (header.value) |c| {
+            if (c == '\r' or c == '\n' or c == 0) return error.InvalidHeaderValue;
+        }
+        for (reserved_header_names) |reserved| {
+            if (std.ascii.eqlIgnoreCase(header.name, reserved)) return error.ReservedHeader;
+        }
+    }
+
+    fn headersContainAuthorization(headers: []const std.http.Header) bool {
+        for (headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization")) return true;
+        }
+        return false;
+    }
+
+    /// Replaces the caller-supplied headers sent with every request.
+    ///
+    /// The transport takes its own copies, so `headers` need not outlive the
+    /// call. Validation is all-or-nothing: on error the previous headers are
+    /// left in place.
+    pub fn setExtraHeaders(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        headers: []const std.http.Header,
+    ) (HeaderError || std.mem.Allocator.Error)!void {
+        for (headers) |h| try validateHeader(h);
+        if (self.authorization_token != null and headersContainAuthorization(headers)) {
+            return error.DuplicateAuthorization;
+        }
+
+        const owned = try allocator.alloc(std.http.Header, headers.len);
+        var filled: usize = 0;
+        errdefer {
+            for (owned[0..filled]) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(owned);
+        }
+        for (headers, 0..) |h, i| {
+            const name = try allocator.dupe(u8, h.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, h.value);
+            owned[i] = .{ .name = name, .value = value };
+            filled = i + 1;
+        }
+
+        self.freeExtraHeaders(allocator);
+        self.extra_headers = owned;
     }
 
     /// Sends a JSON-RPC message via HTTP POST.
-    pub fn send(self: *Self, _: std.Io, allocator: std.mem.Allocator, message: []const u8) Transport.SendError!void {
+    pub fn send(self: *Self, io: std.Io, allocator: std.mem.Allocator, message: []const u8) Transport.SendError!void {
         if (self.is_closed) return Transport.SendError.ConnectionClosed;
 
-        var client: std.http.Client = .{ .allocator = allocator };
+        var client: std.http.Client = .{ .allocator = allocator, .io = io };
         defer client.deinit();
 
         const uri = std.Uri.parse(self.endpoint) catch return Transport.SendError.WriteError;
@@ -237,9 +394,25 @@ pub const HttpTransport = struct {
             };
         }
 
+        // Validated on the way in, so nothing here can inject a second header.
+        extra_headers.appendSlice(allocator, self.extra_headers) catch {
+            return Transport.SendError.OutOfMemory;
+        };
+
+        // Do not follow redirects. This request carries a bearer token and a
+        // session id, and both are credentials for *this* endpoint. Following a
+        // `Location` would hand them to whatever host the response names.
+        //
+        // `privileged_headers` is not a way out: std stores it, asserts on it
+        // and clears it across domains, but never writes it to the wire, so
+        // putting credentials there drops them from every request instead.
+        // Refusing the redirect is the only fail-closed option, and an MCP
+        // client has a configured endpoint and no reason to be redirected off
+        // it anyway.
         var req = client.request(.POST, uri, .{
             .headers = .{ .user_agent = .{ .override = "mcp.zig" } },
             .extra_headers = extra_headers.items,
+            .redirect_behavior = .not_allowed,
         }) catch return Transport.SendError.WriteError;
         defer req.deinit();
 
@@ -321,6 +494,9 @@ pub const HttpTransport = struct {
 
     /// Sets the authorization token for Bearer auth (OAuth 2.1).
     pub fn setAuthorizationToken(self: *Self, allocator: std.mem.Allocator, token: []const u8) !void {
+        // Two Authorization headers on one request is not a resolvable
+        // ambiguity: pick one place to configure the credential.
+        if (headersContainAuthorization(self.extra_headers)) return error.DuplicateAuthorization;
         if (self.authorization_token) |old| {
             allocator.free(old);
         }
@@ -366,6 +542,7 @@ pub const HttpTransport = struct {
                 .send = sendVtable,
                 .receive = receiveVtable,
                 .close = closeVtable,
+                .deinit = deinitVtable,
             },
         };
     }
@@ -383,6 +560,12 @@ pub const HttpTransport = struct {
     fn closeVtable(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.close();
+    }
+
+    fn deinitVtable(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.deinit(allocator);
+        allocator.destroy(self);
     }
 };
 
@@ -409,7 +592,12 @@ pub fn createTransport(
         .http => {
             const url = options.url orelse return error.MissingUrl;
             const http_transport = try allocator.create(HttpTransport);
+            errdefer allocator.destroy(http_transport);
             http_transport.* = try .init(allocator, url);
+            errdefer http_transport.deinit(allocator);
+            if (options.extra_headers.len > 0) {
+                try http_transport.setExtraHeaders(allocator, options.extra_headers);
+            }
             if (options.authorization_token) |token| {
                 try http_transport.setAuthorizationToken(allocator, token);
             }
@@ -422,6 +610,9 @@ pub fn createTransport(
 pub const TransportOptions = struct {
     url: ?[]const u8 = null,
     authorization_token: ?[]const u8 = null,
+    /// Headers sent with every HTTP request. See
+    /// `HttpTransport.setExtraHeaders` for the validation rules.
+    extra_headers: []const std.http.Header = &.{},
 };
 
 test "StdioTransport initialization" {
@@ -446,4 +637,434 @@ test "HttpTransport session ID" {
 
     try transport_impl.setSessionId(allocator, "test-session-123");
     try std.testing.expectEqualStrings("test-session-123", transport_impl.session_id.?);
+}
+
+/// A minimal HTTP origin used to exercise `HttpTransport` against a real
+/// socket. Serves one reply per connection and records the request head.
+const TestHttpOrigin = struct {
+    listener: *std.Io.net.Server,
+    replies: []const []const u8,
+    captured: [4][]u8 = @splat(&.{}),
+    captured_count: usize = 0,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *TestHttpOrigin) void {
+        for (self.captured[0..self.captured_count]) |c| self.allocator.free(c);
+    }
+
+    /// Connections that carried a real request, ignoring the sentinel used to
+    /// release a pending `accept`.
+    fn requestCount(self: *const TestHttpOrigin) usize {
+        var n: usize = 0;
+        for (self.captured[0..self.captured_count]) |c| {
+            if (std.mem.indexOf(u8, c, "HTTP/1.1") != null) n += 1;
+        }
+        return n;
+    }
+
+    fn run(self: *TestHttpOrigin) void {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        for (self.replies) |reply| {
+            var stream = self.listener.accept(io) catch return;
+            defer stream.close(io);
+
+            var recv_buffer: [4096]u8 = undefined;
+            var send_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(io, &recv_buffer);
+            var writer = stream.writer(io, &send_buffer);
+
+            // Only the head matters for these assertions.
+            var head: std.ArrayList(u8) = .empty;
+            defer head.deinit(self.allocator);
+            while (std.mem.indexOf(u8, head.items, "\r\n\r\n") == null) {
+                var byte: [1]u8 = undefined;
+                const n = reader.interface.readSliceShort(&byte) catch break;
+                if (n == 0) break;
+                head.append(self.allocator, byte[0]) catch break;
+            }
+
+            if (self.captured_count < self.captured.len) {
+                self.captured[self.captured_count] = self.allocator.dupe(u8, head.items) catch &.{};
+                self.captured_count += 1;
+            }
+
+            writer.interface.writeAll(reply) catch {};
+            writer.interface.flush() catch {};
+        }
+    }
+};
+
+/// Bind a loopback listener on the first free port at or above `base_port`.
+fn bindTestListener(io: std.Io, base_port: u16, out_port: *u16) !std.Io.net.Server {
+    var attempt: u16 = 0;
+    while (attempt < 40) : (attempt += 1) {
+        const port = base_port + attempt;
+        const address = std.Io.net.IpAddress.resolve(io, "127.0.0.1", port) catch continue;
+        const listener = std.Io.net.IpAddress.listen(&address, io, .{}) catch continue;
+        out_port.* = port;
+        return listener;
+    }
+    return error.NoFreePort;
+}
+
+test "HttpTransport sends credentials and records the issued session id" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try bindTestListener(io, 39100, &port);
+    defer listener.deinit(io);
+
+    const replies = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nmcp-session-id: issued-session\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}",
+    };
+    var origin: TestHttpOrigin = .{
+        .listener = &listener,
+        .replies = &replies,
+        .allocator = allocator,
+    };
+    defer origin.deinit();
+
+    const thread = try std.Thread.spawn(.{}, TestHttpOrigin.run, .{&origin});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(endpoint);
+
+    var transport_impl = try HttpTransport.init(allocator, endpoint);
+    defer transport_impl.deinit(allocator);
+    try transport_impl.setAuthorizationToken(allocator, "test-token");
+
+    try transport_impl.send(io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
+
+    try std.testing.expectEqual(@as(usize, 1), origin.captured_count);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "authorization: Bearer test-token") != null);
+
+    // The id the server issued must be recorded for subsequent requests.
+    try std.testing.expectEqualStrings("issued-session", transport_impl.session_id.?);
+}
+
+test "HttpTransport refuses to follow a redirect" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try bindTestListener(io, 39200, &port);
+    defer listener.deinit(io);
+
+    // A server that answers with a `Location` it controls would otherwise be
+    // handed the bearer token and the session id on the next hop.
+    var redirect_buf: [256]u8 = undefined;
+    const redirect_reply = try std.fmt.bufPrint(
+        &redirect_buf,
+        "HTTP/1.1 303 See Other\r\nLocation: http://localhost:{d}/steal\r\nContent-Length: 0\r\n\r\n",
+        .{port},
+    );
+    const replies = [_][]const u8{
+        redirect_reply,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}",
+    };
+    var origin: TestHttpOrigin = .{
+        .listener = &listener,
+        .replies = &replies,
+        .allocator = allocator,
+    };
+    defer origin.deinit();
+
+    const thread = try std.Thread.spawn(.{}, TestHttpOrigin.run, .{&origin});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(endpoint);
+
+    var transport_impl = try HttpTransport.init(allocator, endpoint);
+    defer transport_impl.deinit(allocator);
+    try transport_impl.setAuthorizationToken(allocator, "test-token");
+    try transport_impl.setSessionId(allocator, "secret-session");
+
+    try std.testing.expectError(
+        Transport.SendError.WriteError,
+        transport_impl.send(io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"),
+    );
+
+    // The origin is willing to serve a second hop, so a regression that starts
+    // following redirects again fails the assertion below instead of hanging
+    // here. Release the pending accept with a connection that sends nothing.
+    {
+        const sentinel_address = try std.Io.net.IpAddress.resolve(io, "127.0.0.1", port);
+        var sentinel = try std.Io.net.IpAddress.connect(&sentinel_address, io, .{ .mode = .stream });
+        sentinel.close(io);
+    }
+
+    // Exactly one hop: the redirect was never followed, so the credentials
+    // were never offered to the redirect target.
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "authorization:") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "mcp-session-id:") != null);
+
+    // Nothing was queued from a failed request.
+    try std.testing.expectEqual(@as(usize, 0), transport_impl.pending_responses.items.len);
+}
+
+test "Client.connectHttp round-trips and frees everything it allocates" {
+    // Exercises the whole client HTTP path under the testing allocator, which
+    // fails on any leak. Nothing else in the tree instantiates HttpTransport,
+    // and without a test like this Zig never analyses it at all.
+    const client_mod = @import("../client/client.zig");
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try bindTestListener(io, 39300, &port);
+    defer listener.deinit(io);
+
+    // A real handshake reply: `connectHttp` now validates the negotiated
+    // version instead of discarding the response.
+    const init_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"srv\",\"version\":\"9.9\"}}}";
+    const tools_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\"}]}}";
+
+    var init_reply_buf: [512]u8 = undefined;
+    var tools_reply_buf: [512]u8 = undefined;
+    const init_reply = try std.fmt.bufPrint(&init_reply_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nmcp-session-id: issued-session\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ init_body.len, init_body });
+    const tools_reply = try std.fmt.bufPrint(&tools_reply_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ tools_body.len, tools_body });
+    // The middle reply answers `notifications/initialized`, which the
+    // handshake now sends; an empty body must not be mistaken for a response.
+    const accepted = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    const replies = [_][]const u8{ init_reply, accepted, tools_reply };
+    var origin: TestHttpOrigin = .{
+        .listener = &listener,
+        .replies = &replies,
+        .allocator = allocator,
+    };
+    defer origin.deinit();
+
+    const thread = try std.Thread.spawn(.{}, TestHttpOrigin.run, .{&origin});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(endpoint);
+
+    var client: client_mod.Client = .init(io, allocator, .{ .name = "test-client", .version = "1.0.0" });
+    defer client.deinit(io, allocator);
+
+    try client.connectHttp(io, allocator, endpoint);
+    try std.testing.expectEqualStrings("2025-11-25", client.negotiated_version.?);
+    try std.testing.expect(client.serverCapabilities() != null);
+
+    const tools = try client.listTools(io, allocator, .{});
+    defer tools.deinit();
+
+    // The result actually reached the caller, rather than being dropped.
+    const list = tools.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqualStrings("echo", list.items[0].object.get("name").?.string);
+
+    try std.testing.expectEqual(@as(usize, 3), origin.requestCount());
+    // The handshake response carried a session id; later requests replay it.
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[2], "mcp-session-id: issued-session") != null);
+}
+
+fn stdioFromFixture(dir: std.Io.Dir, io: std.Io, name: []const u8, contents: []const u8) !std.Io.File {
+    const w = try dir.createFile(io, name, .{});
+    try w.writeStreamingAll(io, contents);
+    w.close(io);
+    return try dir.openFile(io, name, .{});
+}
+
+test "stdio receive buffers ahead instead of reading a byte at a time" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const in = try stdioFromFixture(tmp.dir, io, "in.jsonl", "one\ntwo\n");
+    defer in.close(io);
+
+    var t: StdioTransport = .{ .in = in };
+    defer t.deinit(allocator);
+
+    const first = (try t.receive(io, allocator)).?;
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("one", first);
+
+    // The byte-at-a-time reader stopped exactly at the newline, so it never
+    // held anything after returning a message. A buffered read pulls the rest
+    // of the chunk too, which is the whole point of the fix.
+    try std.testing.expect(t.read_buffer.items.len > 0);
+
+    const second = (try t.receive(io, allocator)).?;
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("two", second);
+
+    try std.testing.expectError(Transport.ReceiveError.EndOfStream, t.receive(io, allocator));
+}
+
+test "stdio receive delivers a trailing message that has no newline" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const in = try stdioFromFixture(tmp.dir, io, "in.jsonl", "solo");
+    defer in.close(io);
+
+    var t: StdioTransport = .{ .in = in };
+    defer t.deinit(allocator);
+
+    const msg = (try t.receive(io, allocator)).?;
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("solo", msg);
+    try std.testing.expectError(Transport.ReceiveError.EndOfStream, t.receive(io, allocator));
+}
+
+test "stdio receive rejects a message larger than the cap" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const in = try stdioFromFixture(tmp.dir, io, "in.jsonl", "0123456789abcdef\n");
+    defer in.close(io);
+
+    var t: StdioTransport = .{ .in = in, .max_message_size = 8 };
+    defer t.deinit(allocator);
+
+    try std.testing.expectError(Transport.ReceiveError.MessageTooLarge, t.receive(io, allocator));
+}
+
+test "stdio send writes to the configured stream, not this process's stdout" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out = try tmp.dir.createFile(io, "out.jsonl", .{});
+    var t: StdioTransport = .{ .out = out };
+    defer t.deinit(allocator);
+    try t.send(io, allocator, "{\"jsonrpc\":\"2.0\"}");
+    out.close(io);
+
+    const written = try tmp.dir.readFileAlloc(io, "out.jsonl", allocator, .limited(1024));
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\"}\n", written);
+}
+
+test "HttpTransport sends caller-supplied headers" {
+    const allocator = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try bindTestListener(io, 39400, &port);
+    defer listener.deinit(io);
+
+    const replies = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1}",
+    };
+    var origin: TestHttpOrigin = .{
+        .listener = &listener,
+        .replies = &replies,
+        .allocator = allocator,
+    };
+    defer origin.deinit();
+
+    const thread = try std.Thread.spawn(.{}, TestHttpOrigin.run, .{&origin});
+    defer thread.join();
+
+    const endpoint = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
+    defer allocator.free(endpoint);
+
+    var transport_impl = try HttpTransport.init(allocator, endpoint);
+    defer transport_impl.deinit(allocator);
+    try transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "X-Api-Key", .value = "sekrit" },
+        .{ .name = "X-Tenant", .value = "acme" },
+    });
+
+    try transport_impl.send(io, allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
+
+    try std.testing.expectEqual(@as(usize, 1), origin.captured_count);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "x-api-key: sekrit") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(origin.captured[0], "x-tenant: acme") != null);
+}
+
+test "HttpTransport rejects headers it builds itself" {
+    const allocator = std.testing.allocator;
+    var transport_impl = try HttpTransport.init(allocator, "http://127.0.0.1:1/");
+    defer transport_impl.deinit(allocator);
+
+    for (HttpTransport.reserved_header_names) |name| {
+        try std.testing.expectError(error.ReservedHeader, transport_impl.setExtraHeaders(allocator, &.{
+            .{ .name = name, .value = "x" },
+        }));
+    }
+    // Case must not be an escape hatch.
+    try std.testing.expectError(error.ReservedHeader, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "Mcp-Session-Id", .value = "x" },
+    }));
+}
+
+test "HttpTransport rejects header values and names that would inject a header" {
+    const allocator = std.testing.allocator;
+    var transport_impl = try HttpTransport.init(allocator, "http://127.0.0.1:1/");
+    defer transport_impl.deinit(allocator);
+
+    try std.testing.expectError(error.InvalidHeaderValue, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "X-Evil", .value = "a\r\nX-Injected: yes" },
+    }));
+    try std.testing.expectError(error.InvalidHeaderValue, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "X-Evil", .value = "a\nb" },
+    }));
+    try std.testing.expectError(error.InvalidHeaderName, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "X-Evil: injected", .value = "a" },
+    }));
+    try std.testing.expectError(error.InvalidHeaderName, transport_impl.setExtraHeaders(allocator, &.{
+        .{ .name = "", .value = "a" },
+    }));
+
+    // A rejected batch must leave the previous configuration untouched.
+    try std.testing.expectEqual(@as(usize, 0), transport_impl.extra_headers.len);
+}
+
+test "HttpTransport refuses two sources of Authorization" {
+    const allocator = std.testing.allocator;
+
+    var a = try HttpTransport.init(allocator, "http://127.0.0.1:1/");
+    defer a.deinit(allocator);
+    try a.setAuthorizationToken(allocator, "tok");
+    try std.testing.expectError(error.DuplicateAuthorization, a.setExtraHeaders(allocator, &.{
+        .{ .name = "Authorization", .value = "Basic abc" },
+    }));
+
+    var b = try HttpTransport.init(allocator, "http://127.0.0.1:1/");
+    defer b.deinit(allocator);
+    try b.setExtraHeaders(allocator, &.{.{ .name = "authorization", .value = "Basic abc" }});
+    try std.testing.expectError(error.DuplicateAuthorization, b.setAuthorizationToken(allocator, "tok"));
 }
