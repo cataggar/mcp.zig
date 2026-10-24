@@ -1,6 +1,7 @@
 name: Release
 permissions:
   contents: write
+  attestations: read
 
 on:
   release:
@@ -16,9 +17,13 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
-      - uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.9.0
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: 0.17.0
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Run Tests
         run: zig build test
 
@@ -57,9 +62,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-      - uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.9.0
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: 0.17.0
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Compile library and examples
         run: zig build -Dtarget=${{ matrix.target }}
@@ -88,9 +97,13 @@ jobs:
           - arm-freestanding
     steps:
       - uses: actions/checkout@v5
-      - uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.9.0
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: 0.17.0
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       
       - name: Build Library
         run: zig build -Doptimize=safe -Dtarget=${{ matrix.target }}
@@ -119,9 +132,13 @@ jobs:
         id: get_url
         run: echo "url=https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz" >> $GITHUB_OUTPUT
 
-      - uses: mlugg/setup-zig@v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.9.0
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: 0.17.0
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Calculate Hash
         id: calc_hash
